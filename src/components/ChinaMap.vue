@@ -1,4 +1,4 @@
-<template>
+<!-- <template>
   <div class="map-container">
     <div class="dropdown-container">
       <select v-model="selectedLocationType" @change="selectAttribute">
@@ -726,5 +726,352 @@ select {
   border-radius: 50px;
   cursor: pointer;
   display: block;
+}
+</style> -->
+
+<script setup lang="ts">
+import { use } from 'echarts/core';
+import { CanvasRenderer } from 'echarts/renderers';
+import { GraphChart } from 'echarts/charts';
+import {
+  TitleComponent,
+  TooltipComponent,
+  LegendComponent,
+  ToolboxComponent
+} from 'echarts/components';
+import VChart, { THEME_KEY } from 'vue-echarts';
+import { ref, onMounted, computed, provide, onUnmounted } from 'vue';
+import { Search, Refresh, FullScreen, VideoPause, VideoPlay, Aim } from '@element-plus/icons-vue';
+
+use([CanvasRenderer, GraphChart, TitleComponent, TooltipComponent, LegendComponent, ToolboxComponent]);
+provide(THEME_KEY, 'light');
+
+const chartInstance = ref<any>(null);
+const explorerWrapperRef = ref<HTMLElement | null>(null);
+const isFullscreen = ref(false);
+const isPaused = ref(false); 
+const loading = ref(true);
+const searchQuery = ref('');
+const graphData = ref<any>({ nodes: [], links: [], categories: [] });
+
+const CATEGORY_COLOR_MAP: Record<string, string> = {
+  '检测样本': '#ef4444', 
+  '农贸市场': '#409eff', 
+  '养殖户': '#67c23a',   
+  '水产品': '#e6a23c',   
+  '污染物': '#909399'    
+};
+
+const chartOption = computed(() => {
+  return {
+    backgroundColor: '#ffffff',
+    title: {
+      text: '全域风险关联图谱 (全量数据)',
+      subtext: `当前节点数: ${graphData.value.nodes.length} | 边数: ${graphData.value.links.length}`,
+      top: 20,
+      left: 20,
+      textStyle: { fontSize: 16, fontWeight: 'bold', color: '#333' }
+    },
+    tooltip: {
+      trigger: 'item',
+      backgroundColor: 'rgba(255,255,255,0.95)',
+      textStyle: { color: '#333' },
+      formatter: (params: any) => {
+        if (params.dataType === 'edge') {
+          return `${params.data.source} <span style="color:#ccc">--</span> ${params.data.target}`;
+        }
+        const d = params.data;
+        return `
+          <div style="font-weight:bold;border-bottom:1px solid #eee;padding-bottom:4px;margin-bottom:4px">${d.name}</div>
+          <div>ID: <span style="font-family:monospace">${d.id}</span></div>
+          <div>类型: ${d.category}</div>
+        `;
+      }
+    },
+    legend: {
+      data: graphData.value.categories.map((a: any) => a.name),
+      bottom: 20,
+      left: 'center',
+      itemGap: 20,
+      selectedMode: true 
+    },
+    series: [
+      {
+        name: 'Risk Graph',
+        type: 'graph',
+        layout: 'force',
+        data: graphData.value.nodes,
+        links: graphData.value.links,
+        categories: graphData.value.categories,
+        
+        roam: true,        
+        draggable: true,   
+        zoom: 0.4,      // 缩小视野，以便看到全貌   
+        
+        // [性能优化] 开启渐进式渲染，防止几千个点直接卡死浏览器
+        progressiveThreshold: 500,
+        progressive: 200,
+        
+        label: {
+          show: false, 
+          position: 'right',
+          formatter: '{b}',
+          color: '#333'
+        },
+        
+        lineStyle: {
+          color: '#ccc',
+          curveness: 0.1,
+          opacity: 0.1,  // 线条更淡一点，因为线太多了
+          width: 0.3
+        },
+        
+        force: {
+          initLayout: 'circular',
+          repulsion: 2000,        // [关键] 更大的斥力，因为点太多了
+          gravity: 0.1,           // 稍大的引力，防止边缘节点飞太远
+          edgeLength: [50, 300],
+          
+          // 默认关闭动画 (预计算布局)，保证一出来就是一张铺开的大网
+          // 如果开启 true，上万个点的实时计算会让浏览器掉帧严重
+          layoutAnimation: !isPaused.value,
+          friction: isPaused.value ? 1.0 : 0.6
+        },
+        
+        emphasis: {
+          focus: 'adjacency', 
+          lineStyle: { width: 2, color: 'source', opacity: 1 },
+          label: {
+            show: true,
+            fontWeight: 'bold',
+            fontSize: 12,
+            backgroundColor: 'rgba(255,255,255,0.8)',
+            padding: [2, 4],
+            borderRadius: 2
+          },
+          itemStyle: {
+            borderColor: '#000',
+            borderWidth: 1,
+            shadowBlur: 10,
+            shadowColor: 'rgba(0,0,0,0.3)'
+          }
+        }
+      }
+    ]
+  };
+});
+
+const loadData = async () => {
+  loading.value = true;
+  try {
+    const res = await fetch('/api_data_risk_network.json');
+    const data = await res.json();
+    
+    // [修改] 移除所有过滤逻辑，全量加载
+    const allNodes = data.nodes.map((n: any) => {
+      // 依然保留大节点的默认标签显示
+      if (n.symbolSize > 15) {
+        return { ...n, label: { show: true, fontSize: 10, color: '#333' } };
+      }
+      return n;
+    });
+
+    const categoriesWithColor = data.categories.map((c: any) => ({
+      name: c.name,
+      itemStyle: { color: CATEGORY_COLOR_MAP[c.name] || '#ccc' }
+    }));
+
+    graphData.value = {
+      nodes: allNodes,
+      links: data.links,
+      categories: categoriesWithColor
+    };
+  } catch (e) {
+    console.error(e);
+  } finally {
+    loading.value = false;
+  }
+};
+
+const togglePause = () => {
+  isPaused.value = !isPaused.value;
+  if (chartInstance.value) {
+      chartInstance.value.setOption({
+          series: [{
+              force: {
+                  friction: isPaused.value ? 1.0 : 0.6
+              }
+          }]
+      });
+  }
+};
+
+const toggleFullscreen = () => {
+  const el = explorerWrapperRef.value;
+  if (!el) return;
+
+  if (!document.fullscreenElement) {
+    el.requestFullscreen().catch(err => {
+      console.error(`全屏失败: ${err.message}`);
+    });
+    isFullscreen.value = true;
+  } else {
+    document.exitFullscreen();
+    isFullscreen.value = false;
+  }
+};
+
+const onFullscreenChange = () => {
+  isFullscreen.value = !!document.fullscreenElement;
+};
+
+const handleReset = () => {
+  if (chartInstance.value) {
+    chartInstance.value.dispatchAction({ type: 'restore' });
+    isPaused.value = false;
+    chartInstance.value.setOption({
+          series: [{ force: { friction: 0.6 } }]
+    });
+  }
+};
+
+const handleSearch = () => {
+  if (!searchQuery.value || !chartInstance.value) return;
+  const targetNode = graphData.value.nodes.find((n: any) => 
+    n.name.includes(searchQuery.value) || n.id.includes(searchQuery.value)
+  );
+  
+  if (targetNode) {
+    chartInstance.value.dispatchAction({
+      type: 'highlight',
+      seriesIndex: 0,
+      name: targetNode.name
+    });
+    
+    isPaused.value = true;
+    alert(`已定位: ${targetNode.name}\n图表已暂停锁定。`);
+  } else {
+    alert('未找到匹配的节点');
+  }
+};
+
+onMounted(() => {
+  loadData();
+  document.addEventListener('fullscreenchange', onFullscreenChange);
+});
+
+onUnmounted(() => {
+  document.removeEventListener('fullscreenchange', onFullscreenChange);
+});
+</script>
+
+<template>
+  <div class="explorer-wrapper" ref="explorerWrapperRef">
+    <div class="toolbar">
+      <div class="search-group">
+        <el-input 
+          v-model="searchQuery" 
+          placeholder="搜索节点..." 
+          :prefix-icon="Search"
+          @keyup.enter="handleSearch"
+          clearable
+          class="search-input"
+        />
+        <el-button :icon="Aim" circle @click="handleSearch" title="定位" />
+      </div>
+      
+      <div class="action-group">
+        <el-button 
+          :type="isPaused ? 'danger' : 'success'" 
+          :icon="isPaused ? VideoPlay : VideoPause" 
+          circle 
+          @click="togglePause"
+          :title="isPaused ? '点击继续' : '点击停止'"
+        />
+        
+        <el-button 
+          circle 
+          :icon="FullScreen" 
+          @click="toggleFullscreen" 
+          :title="isFullscreen ? '退出全屏' : '全屏模式'"
+          :type="isFullscreen ? 'primary' : 'default'"
+        />
+        
+        <el-button :icon="Refresh" circle @click="handleReset" title="重置视图" />
+      </div>
+    </div>
+
+    <div class="chart-area" v-loading="loading" element-loading-text="正在渲染全量数据...">
+      <v-chart 
+        ref="chartInstance"
+        class="chart" 
+        :option="chartOption" 
+        autoresize 
+      />
+    </div>
+    
+    <div class="status-bar" v-if="isPaused">
+      <span class="paused-tag">🛑 布局已锁定</span>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.explorer-wrapper {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  position: relative;
+}
+
+.explorer-wrapper:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  padding: 20px;
+  box-sizing: border-box;
+  background: #fff;
+}
+
+.toolbar {
+  height: 50px;
+  padding: 0 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #f0f0f0;
+  background: #fafafa;
+  z-index: 10;
+}
+
+.search-group, .action-group { display: flex; gap: 8px; }
+.search-input { width: 220px; }
+
+.chart-area {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  position: relative;
+}
+
+.chart { width: 100%; height: 100%; }
+
+.status-bar {
+  position: absolute;
+  top: 60px;
+  right: 20px;
+  pointer-events: none;
+}
+
+.paused-tag {
+  background: rgba(255, 0, 0, 0.1);
+  color: #ff0000;
+  border: 1px solid #ffcccc;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: bold;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
 </style>

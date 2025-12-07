@@ -1,20 +1,25 @@
 <script setup lang="ts">
+import { computed } from 'vue';
 import { useExplorerStore } from '@/stores/explorerStore';
 import { storeToRefs } from 'pinia';
 import { RefreshLeft, Filter, Search, Close } from '@element-plus/icons-vue';
 
+// 1. Initialize Store
 const store = useExplorerStore();
+const { filterOptions, selectedSampleId, pivotFilter } = storeToRefs(store);
 
-const { filterOptions, topRankedAnomalies, selectedSampleId, pivotFilter } = storeToRefs(store);
+// 2. Computed Properties for Dynamic Lists
+// Determines whether to show the "Risk" list or the "Safe" list based on the store's current mode
+const currentDisplayList = computed(() => store.currentDisplayList);
+const currentMode = computed(() => store.currentAnalysisMode);
 
+// 3. Action Handlers
 function applyFilters() { store.applyFilters(); }
 function resetFilters() { store.resetFilters(); }
 function onSampleSelect(newId: string | number | null) { store.selectSample(newId); }
+function clearPivot() { store.clearPivotFilter(); }
 
-function clearPivot() {
-  store.clearPivotFilter();
-}
-
+// Static Options
 const riskLevelOptions = ['高风险', '中风险', '低风险'];
 </script>
 
@@ -27,41 +32,58 @@ const riskLevelOptions = ['高风险', '中风险', '低风险'];
     
     <div class="section-main">
       <div class="label-row">
-        <span class="section-label">Top 20 Anomalies</span>
-        <el-tag size="small" color="#1f2937" effect="dark" style="border:none">{{ topRankedAnomalies.length }} Detected</el-tag>
+        <span class="section-label">
+          {{ currentMode === 'risk' ? 'Top 20 Anomalies' : 'Top 20 Safe Samples' }}
+        </span>
+        
+        <el-tag 
+          size="small" 
+          :color="currentMode === 'risk' ? '#1f2937' : '#10b981'" 
+          effect="dark" 
+          style="border:none"
+        >
+          {{ currentDisplayList.length }} Detected
+        </el-tag>
       </div>
       
       <el-select
         :model-value="selectedSampleId"
         @change="onSampleSelect"
-        placeholder="Select a sample to analyze..."
+        :placeholder="currentMode === 'risk' ? 'Select a high-risk sample...' : 'Select a safe sample...'"
         class="main-selector"
         clearable
         filterable
       >
         <template #prefix><el-icon class="search-icon"><Search /></el-icon></template>
+        
         <el-option
-          v-for="sample in topRankedAnomalies"
+          v-for="sample in currentDisplayList"
           :key="sample.id"
-          :label="`ID: ${sample.id} (Score: ${sample.score.toFixed(3)})`"
+          :label="`ID: ${sample.id} (${sample.riskLevel})`" 
           :value="sample.id"
         >
-          <span style="float: left; font-family: monospace; font-weight: 600; color: #333">ID: {{ sample.id }}</span>
-          <span style="float: right; color: #8492a6; font-size: 12px; font-family: monospace;">
-            {{ sample.score.toFixed(3) }}
-          </span>
+          <div style="display: flex; justify-content: space-between; width: 100%">
+            <span style="font-weight: 600; color: #333">ID: {{ sample.id }}</span>
+            <span style="color: #8492a6; font-size: 12px; font-family: monospace;">
+              Score: {{ sample.score.toFixed(3) }}
+            </span>
+          </div>
         </el-option>
       </el-select>
-      <div class="helper-text">Select from the highest risk samples to visualize their context path.</div>
+
+      <div class="helper-text">
+        <span v-if="currentMode === 'risk'">Select from the highest risk samples to visualize their context path.</span>
+        <span v-else style="color: #059669;">Select from the safest samples to analyze normal operational patterns.</span>
+      </div>
     </div>
 
     <div class="divider"></div>
 
     <div v-if="pivotFilter" class="pivot-section">
-      <div class="pivot-label">Active Filter</div>
+      <div class="pivot-label">Active Context Filter</div>
       <div class="pivot-card">
         <div class="pivot-content">
-          <span class="pivot-prefix">Related to:</span>
+          <span class="pivot-prefix">Focusing on Entity:</span>
           <span class="pivot-value">{{ pivotFilter }}</span>
         </div>
         <el-icon class="pivot-close-icon" @click="clearPivot"><Close /></el-icon>
@@ -85,7 +107,7 @@ const riskLevelOptions = ['高风险', '中风险', '低风险'];
       </div>
 
       <div class="form-group">
-        <label>Anomaly Score Range</label>
+        <label>Score Range ({{ filterOptions.scoreThreshold[0] }} - {{ filterOptions.scoreThreshold[1] }})</label>
         <el-slider
           v-model="filterOptions.scoreThreshold"
           range
@@ -96,21 +118,21 @@ const riskLevelOptions = ['高风险', '中风险', '低风险'];
           class="custom-slider"
         />
         <div class="range-display">
-          <span>{{ filterOptions.scoreThreshold[0] }}</span>
-          <span>{{ filterOptions.scoreThreshold[1] }}</span>
+          <span>Min: 0.0</span>
+          <span>Max: 1.0</span>
         </div>
       </div>
       
       <div class="action-row">
-        <el-button class="btn-apply" type="primary" color="#1f2937" @click="applyFilters">Apply</el-button>
-        <el-button class="btn-reset" :icon="RefreshLeft" circle @click="resetFilters" title="Reset"></el-button>
+        <el-button class="btn-apply" type="primary" color="#1f2937" @click="applyFilters">Apply Filters</el-button>
+        <el-button class="btn-reset" :icon="RefreshLeft" circle @click="resetFilters" title="Reset View"></el-button>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-/* 容器：纯白、无边框，极简 */
+/* --- Layout & Typography --- */
 .control-panel {
   height: 100%;
   padding: 24px;
@@ -120,15 +142,16 @@ const riskLevelOptions = ['高风险', '中风险', '低风险'];
   flex-direction: column;
   font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
   color: #333;
+  border-right: 1px solid #f0f0f0; /* Subtle border for separation */
 }
 
-/* 标题样式 */
+/* Header */
 .panel-header {
   margin-bottom: 24px;
 }
 .panel-header h3 {
   margin: 0;
-  font-family: 'Times New Roman', serif; /* 学术感 */
+  font-family: 'Times New Roman', serif; /* Academic feel */
   font-size: 18px;
   font-weight: 700;
   color: #1f2937;
@@ -140,9 +163,11 @@ const riskLevelOptions = ['高风险', '中风险', '低风险'];
   text-transform: uppercase;
   letter-spacing: 1px;
   font-weight: 600;
+  display: block;
+  margin-top: 4px;
 }
 
-/* 核心选择区 */
+/* --- Main Selection Section --- */
 .section-main {
   margin-bottom: 20px;
 }
@@ -159,19 +184,20 @@ const riskLevelOptions = ['高风险', '中风险', '低风险'];
 }
 .helper-text {
   font-size: 11px;
-  color: #9ca3af;
-  margin-top: 6px;
+  color: #6b7280;
+  margin-top: 8px;
   line-height: 1.4;
+  font-style: italic;
 }
 
-/* 分割线 */
+/* Divider */
 .divider {
   height: 1px;
   background-color: #f3f4f6;
   margin: 10px 0 24px 0;
 }
 
-/* Pivot Filter 样式优化 (去蓝化) */
+/* --- Pivot Filter Card --- */
 .pivot-section {
   margin-bottom: 24px;
 }
@@ -183,14 +209,15 @@ const riskLevelOptions = ['高风险', '中风险', '低风险'];
   margin-bottom: 6px;
 }
 .pivot-card {
-  background-color: #f9fafb; /* 极淡灰 */
+  background-color: #f9fafb; /* Very light gray */
   border: 1px solid #e5e7eb;
-  border-left: 3px solid #374151; /* 深灰左边框 */
+  border-left: 3px solid #374151; /* Dark accent on left */
   border-radius: 4px;
   padding: 10px 12px;
   display: flex;
   justify-content: space-between;
   align-items: center;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.05);
 }
 .pivot-content {
   font-size: 13px;
@@ -201,13 +228,13 @@ const riskLevelOptions = ['高风险', '中风险', '低风险'];
   margin-right: 8px;
 }
 .pivot-prefix { opacity: 0.6; margin-right: 4px; font-size: 12px;}
-.pivot-value { font-weight: 600; font-family: monospace; }
+.pivot-value { font-weight: 600; font-family: monospace; color: #1f2937; }
 .pivot-close-icon {
-  cursor: pointer; color: #9ca3af; transition: color 0.2s;
+  cursor: pointer; color: #9ca3af; transition: all 0.2s; font-size: 14px;
 }
-.pivot-close-icon:hover { color: #111; }
+.pivot-close-icon:hover { color: #ef4444; transform: scale(1.1); }
 
-/* 表单区 */
+/* --- Form Area --- */
 .filter-form {
   display: flex;
   flex-direction: column;
@@ -233,22 +260,29 @@ const riskLevelOptions = ['高风险', '中风险', '低风险'];
 .range-display {
   display: flex;
   justify-content: space-between;
-  font-size: 11px;
+  font-size: 10px;
   color: #9ca3af;
-  margin-top: -4px;
+  margin-top: -2px;
   font-family: monospace;
 }
 
-/* 按钮组 */
+/* Action Buttons */
 .action-row {
   display: flex;
   gap: 10px;
-  margin-top: 8px;
+  margin-top: 12px;
 }
 .btn-apply {
   flex: 1;
   font-weight: 600;
-  border: none; /* 去边框 */
+  border: none;
+  letter-spacing: 0.5px;
+  transition: opacity 0.2s;
+}
+.btn-apply:hover { opacity: 0.9; }
+.btn-reset {
+  border-color: #e5e7eb;
+  color: #6b7280;
 }
 .btn-reset:hover {
   color: #1f2937;
@@ -256,33 +290,41 @@ const riskLevelOptions = ['高风险', '中风险', '低风险'];
   background-color: transparent;
 }
 
-/* Element Plus 样式覆写 (颜色替换：#3b82f6 -> #1f2937) */
+/* --- Element Plus Overrides (The "Clean" Look) --- */
 :deep(.el-input__wrapper) {
   box-shadow: 0 0 0 1px #e5e7eb inset !important;
-  background-color: #fff; /* 纯白输入框 */
-  border-radius: 2px;
+  background-color: #fff;
+  border-radius: 4px;
+  padding: 4px 11px;
 }
 :deep(.el-input__wrapper:hover), :deep(.el-input__wrapper.is-focus) {
-  box-shadow: 0 0 0 1px #1f2937 inset !important; /* 聚焦变深灰 */
+  box-shadow: 0 0 0 1px #1f2937 inset !important;
 }
 :deep(.el-select .el-input__inner) {
   font-weight: 500;
   color: #111;
+  font-size: 13px;
 }
 :deep(.search-icon) { color: #9ca3af; }
 
-/* Slider 颜色替换 */
+/* Slider Styling */
 :deep(.custom-slider .el-slider__bar) {
   background-color: #1f2937;
 }
 :deep(.custom-slider .el-slider__button) {
   border-color: #1f2937;
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
+  background-color: #fff;
 }
-:deep(.el-tag--danger) {
-    --el-tag-bg-color: #1f2937;
-    --el-tag-border-color: #1f2937;
-    --el-tag-text-color: #fff;
+:deep(.custom-slider .el-slider__runway) {
+  background-color: #f3f4f6;
+}
+
+/* Tag overrides for non-risk mode */
+:deep(.el-tag--success) {
+  --el-tag-bg-color: #10b981;
+  --el-tag-border-color: #10b981;
+  --el-tag-text-color: #fff;
 }
 </style>

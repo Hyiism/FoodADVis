@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { use } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
-import { GraphChart } from 'echarts/charts'; // 还是用图关系图
+import { GraphChart } from 'echarts/charts';
 import {
   TitleComponent,
   TooltipComponent,
@@ -12,7 +12,7 @@ import { computed, provide } from 'vue';
 import { useExplorerStore } from '@/stores/explorerStore';
 import { storeToRefs } from 'pinia';
 
-// 1. 注册 ECharts 组件
+// 1. Register ECharts components
 use([
   CanvasRenderer,
   GraphChart,
@@ -23,123 +23,164 @@ use([
 
 provide(THEME_KEY, 'light');
 
-// 2. 连接 Store
+// 2. Connect Store
 const store = useExplorerStore();
-// 我们需要“选中的 ID”和它的“上下文”
-const { selectedSampleId, selectedSampleContext } = storeToRefs(store);
+// Access necessary state and getters
+// Note: currentContext is the getter we updated in the store previously
+const { selectedSampleId, currentContext } = storeToRefs(store);
 
-// 3. 颜色映射 (和 MetaPathView 保持一致)
-const TYPE_COLORS: Record<string, string> = {
-  'InspectionRecord': '#c23531',
-  'Product': '#e6a23c',
-  'Market': '#409eff',
-  'Farmer': '#67c23a',
-  'Contaminant': '#909399',
-  'Unknown': '#000'
-};
+// Access the current analysis mode (risk vs safe)
+const currentMode = computed(() => store.currentAnalysisMode);
 
-// 4. [核心] 计算 ECharts Graph 的 Option
+// 3. Dynamic Color Mapping
+// Returns different color palettes based on the analysis mode
+const COLORS = computed(() => {
+  const isSafe = currentMode.value === 'safe';
+  return {
+    center: isSafe ? '#67c23a' : '#c23531', // Green for safe, Red for risk
+    edge: isSafe ? '#e1f3d8' : '#fde2e2',   // Light green edge vs Light red edge
+    categories: {
+      'InspectionRecord': isSafe ? '#67c23a' : '#c23531',
+      'Product': '#e6a23c',
+      'Market': '#409eff',
+      // Highlight Farmers in safe mode as they are often key to quality
+      'Farmer': isSafe ? '#95d475' : '#67c23a', 
+      'Contaminant': '#909399',
+      'Unknown': '#000'
+    }
+  };
+});
+
+// 4. Compute ECharts Option
 const chartOption = computed(() => {
-  // 必须选中了一个样本，并且它的上下文 *已加载*
-  if (!selectedSampleId.value || !selectedSampleContext.value) {
-    return null; // 如果为 null, 模板会显示“空状态”
+  // A. Check for missing selection
+  if (!selectedSampleId.value) return null;
+  
+  // B. Check for valid context data
+  const context = currentContext.value; 
+  if (!context || Object.keys(context).length === 0) {
+    return null; 
   }
 
-  const context = selectedSampleContext.value;
   const nodes: any[] = [];
   const edges: any[] = [];
+  const categoriesMap = new Set<string>();
+  const isSafe = currentMode.value === 'safe';
 
-  // 1. 添加“中心”节点 (我们选中的样本)
-  const centerNodeId = `InspectionRecord[${selectedSampleId.value}]`;
+  // 1. Add "Center" Node (Selected Sample)
+  const centerNodeId = `InspectionRecord_${selectedSampleId.value}`;
   nodes.push({
     id: centerNodeId,
     name: centerNodeId,
-    value: `样本 ID: ${selectedSampleId.value}`,
-    symbolSize: 40, // 中心节点最大
-    category: 'InspectionRecord',
-    label: { show: true, formatter: `样本\n[${selectedSampleId.value}]` },
-    // 固定在中心
-    x: 0,
-    y: 0,
+    value: `Sample ID: ${selectedSampleId.value}`,
+    symbolSize: 45,
+    category: 0, // Reserve index 0 for InspectionRecord
+    // Dynamic label and styling based on mode
+    label: { 
+        show: true, 
+        formatter: isSafe ? `✅ Quality Sample\n[${selectedSampleId.value}]` : `⚠️ Anomaly Sample\n[${selectedSampleId.value}]`,
+        fontSize: 11,
+        fontWeight: 'bold'
+    },
+    itemStyle: { 
+        color: COLORS.value.center,
+        borderColor: '#fff',
+        borderWidth: 2,
+        shadowBlur: 10,
+        shadowColor: COLORS.value.center
+    },
     fixed: true,
+    x: 300, 
+    y: 300
   });
+  categoriesMap.add('InspectionRecord');
   
-  // 2. 遍历上下文，添加“邻居”节点和“边”
-  // (Object.entries 会遍历 context 里的 'products', 'markets' ...)
-  for (const [type, idList] of Object.entries(context)) {
+  // 2. Iterate context to add Neighbors and Edges
+  // Context structure: { products: [1, 2], markets: [3], ... }
+  Object.entries(context).forEach(([key, idList]) => {
+    // Simple plural to singular conversion: products -> Product
+    let type = key.charAt(0).toUpperCase() + key.slice(1);
+    if (type.endsWith('s')) type = type.slice(0, -1);
     
-    // (把 'products' 转换成 'Product')
-    const nodeType = type.charAt(0).toUpperCase() + type.slice(1, -1);
-    
-    (idList as (string | number)[]).forEach((id: string | number) => {
-      const neighborNodeId = `${nodeType}[${id}]`;
-      
-      // 添加邻居节点
-      nodes.push({
-        id: neighborNodeId,
-        name: neighborNodeId,
-        value: `ID: ${id}`,
-        symbolSize: 20,
-        category: nodeType,
-        label: { show: true, formatter: `${nodeType}\n[${id}]` },
-        draggable: true,
-      });
-      
-      // 添加从邻居指向中心的边
-      edges.push({
-        source: neighborNodeId,
-        target: centerNodeId,
-        lineStyle: {
-          width: 2
+    // Ensure idList is an array
+    if (Array.isArray(idList)) {
+      idList.forEach((id: string | number) => {
+        const neighborId = `${type}_${id}`;
+        
+        // Add Node if unique
+        if (!nodes.find(n => n.id === neighborId)) {
+          nodes.push({
+            id: neighborId,
+            name: neighborId,
+            value: `ID: ${id}`,
+            symbolSize: 25,
+            // category index will be assigned later based on the map order
+            category: 0, 
+            itemStyle: { color: COLORS.value.categories[type] || '#ccc' },
+            label: { show: true, position: 'bottom', formatter: '{b}', fontSize: 10 },
+            draggable: true
+          });
+          categoriesMap.add(type);
         }
+        
+        // Add Edge
+        edges.push({
+          source: neighborId,
+          target: centerNodeId,
+          lineStyle: {
+              width: 2,
+              color: COLORS.value.edge // Dynamic edge color
+          }
+        });
       });
-    });
-  }
+    }
+  });
 
-  // 3. 生成图例
-  const categories = Array.from(new Set(nodes.map(n => n.category))).map(name => ({
-    name: name,
-    itemStyle: { color: TYPE_COLORS[name] || '#000' }
-  }));
+  // 3. Generate Categories Array for ECharts
+  const categories = Array.from(categoriesMap).map(name => ({ name }));
+
+  // Update node category indices to match the categories array
+  nodes.forEach(n => {
+    const catName = n.id.split('_')[0];
+    const idx = Array.from(categoriesMap).indexOf(catName);
+    if (idx !== -1) n.category = idx;
+  });
 
   return {
     title: {
-      text: '样本上下文 (1跳邻居)',
+      text: isSafe ? '✨ Quality Traceability Graph' : '🚨 Risk Association Graph',
+      subtext: isSafe ? '1-Hop Neighbors (Safe Context)' : '1-Hop Neighbors (Risk Context)',
       left: 'center',
       top: 10,
-      textStyle: { fontSize: 14 }
+      textStyle: { fontSize: 14, color: '#333' }
     },
-    tooltip: {
-      formatter: '{b}' // 只显示 name (e.g., "Product[5040]")
-    },
+    tooltip: {},
     legend: {
       data: categories.map(c => c.name),
-      bottom: 10,
+      bottom: 5,
       itemWidth: 15,
       itemHeight: 10,
       textStyle: { fontSize: 10 }
     },
-    animationDurationUpdate: 1000,
     series: [
       {
         type: 'graph',
-        layout: 'force', // 力引导布局
-        force: {
-          repulsion: 200, // 排斥力
-          edgeLength: 100 // 边长
-        },
-        roam: true, // 允许缩放和平移
-        label: {
-          show: true,
-          position: 'bottom',
-          fontSize: 10,
-          color: '#333'
-        },
+        layout: 'force',
         data: nodes,
         links: edges,
         categories: categories,
+        roam: true,
+        label: {
+          show: true,
+          position: 'right',
+          formatter: '{b}'
+        },
+        force: {
+          repulsion: 250,
+          edgeLength: 90
+        },
         emphasis: {
-          focus: 'adjacency'
+            focus: 'adjacency'
         }
       }
     ]
@@ -157,24 +198,22 @@ const chartOption = computed(() => {
     />
     
     <div v-else class="empty-state">
-      <span class="icon">👆</span>
-      <p>请在上方散点图中点击一个样本</p>
-      <p>以查看其相关上下文</p>
+      <span class="icon">{{ selectedSampleId ? '🚫' : '🕸️' }}</span>
+      <p v-if="!selectedSampleId">Select a sample to explore its network</p>
+      <p v-else>No context data available for Sample {{ selectedSampleId }}</p>
     </div>
   </div>
 </template>
 
 <style scoped>
-/* (样式和 MetaPathView 的基本一致) */
 .panel-container {
   padding: 0;
   height: 100%;
   width: 100%;
-  box-sizing: border-box;
   background-color: #ffffff;
-  border-top: 1px solid #e0e0e0;
-  border-right: 1px solid #e0e0e0;
   position: relative;
+  overflow: hidden;
+  border-left: 1px solid #f0f0f0; /* Subtle separator */
 }
 
 .chart {
@@ -191,17 +230,12 @@ const chartOption = computed(() => {
   align-items: center;
   color: #909399;
   text-align: center;
+  font-size: 13px;
 }
 
 .empty-state .icon {
-  font-size: 24px;
-  margin-bottom: 10px;
-  animation: bounce 2s infinite;
-}
-
-@keyframes bounce {
-  0%, 20%, 50%, 80%, 100% {transform: translateY(0);}
-  40% {transform: translateY(-10px);}
-  60% {transform: translateY(-5px);}
+  font-size: 32px;
+  margin-bottom: 12px;
+  opacity: 0.6;
 }
 </style>
