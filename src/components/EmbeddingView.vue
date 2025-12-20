@@ -160,11 +160,20 @@ const chartOption = computed(() => ({
 
 // --- 7. 点击事件 ---
 function handleClick(params: any) {
-  // params.data[3] 就是我们存入的 样本 ID
-  const sampleId = params.data[3];
-  
-  // 调用 store action 来选中/取消选中
-  store.selectSample(sampleId);
+  // >>> 新增调试日志 <<<
+  console.log('👆 EmbeddingView: 捕获点击事件', params);
+
+  // 之前的逻辑
+  // 注意：要确保 params.data 存在且索引正确
+  if (params && params.data) {
+      // 假设 ID 在索引 3 (根据你之前的 chartOption 配置: [x, y, score, id, riskLevel])
+      const sampleId = params.data[3]; 
+      console.log('📍 解析出 SampleID:', sampleId);
+      
+      store.selectSample(sampleId);
+  } else {
+      console.warn('⚠️ 点击无效: params.data 不存在');
+  }
 }
 </script>
 

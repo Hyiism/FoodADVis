@@ -7,10 +7,10 @@ export interface Sample {
   y: number;
   score: number;
   label: string;
-  label_str?: string; // 兼容后端可能生成的字段
+  label_str?: string; 
   riskLevel: string;
   name: string;
-  // Additional fields as per your project requirements
+  // 兼容 V10 Mock 数据生成的新字段
   production_province?: string;
   production_city?: string;
   sale_province?: string;
@@ -18,20 +18,14 @@ export interface Sample {
 }
 
 // 解释路径接口
-interface ExplanationLink {
+export interface ExplanationLink {
   from: string;
   to: string;
   relation: string;
   weight: number;
 }
 
-// 过滤器配置接口
-interface FilterOptions {
-  riskLevels: string[];
-  scoreThreshold: [number, number];
-}
-
-// 上下文数据接口
+// 上下文接口
 export interface ContextData {
   products: (string | number)[];
   markets: (string | number)[];
@@ -41,131 +35,106 @@ export interface ContextData {
 
 export type MetaPathChain = ExplanationLink[];
 
+// 过滤器配置接口
+interface FilterOptions {
+  riskLevels: string[];
+  scoreThreshold: [number, number];
+}
 
 export const useExplorerStore = defineStore('explorer', {
   state: () => ({
     // --- 核心数据 ---
     samples: [] as Sample[],
-    // Context data mapped by sample ID
-    context: {} as Record<number, ContextData>,
-    // Explanations mapped by sample ID
-    explanations: {} as Record<number, MetaPathChain[]>, 
+    context: {} as Record<string, ContextData>, // 注意：Key 经常是字符串
+    explanations: {} as Record<number, MetaPathChain[]>,
     
     // --- 交互状态 ---
     selectedSampleId: null as number | null,
     loading: false,
     
-    // --- 过滤器状态 (适配 ControlPanel.vue) ---
+    // --- 过滤器状态 ---
     filterOptions: {
-      riskLevels: [], // 空数组表示全选/不筛选
+      riskLevels: [], 
       scoreThreshold: [0, 1]
     } as FilterOptions,
     
-    // 枢纽过滤器 (Pivot Filter) - 用于上下文筛选
     pivotFilter: null as string | null,
-    
-    // 搜索关键词
     searchQuery: '',
-    
-    // 省份筛选
-    selectedProvince: null as string | null,
+    selectedProvince: null as string | null, // 省份筛选
   }),
 
   getters: {
-    // 1. 过滤后的样本列表 (核心 Getter)
+    // 1. 过滤后的样本列表
     filteredSamples(state): Sample[] {
       return state.samples.filter(s => {
-        // A. 风险等级筛选
         const riskMatch = state.filterOptions.riskLevels.length === 0 || 
                           state.filterOptions.riskLevels.includes(s.riskLevel);
-        
-        // B. 分数范围筛选
         const [minScore, maxScore] = state.filterOptions.scoreThreshold;
         const scoreMatch = s.score >= minScore && s.score <= maxScore;
-
-        // C. 枢纽筛选 (Pivot)
-        let pivotMatch = true;
-        if (state.pivotFilter) {
-             const match = state.pivotFilter.match(/^(\w+)\[(\d+)\]$/);
-             if (match) {
-                 const typeName = match[1];
-                 const entityId = parseInt(match[2], 10);
-                 // Convert typeName to the key used in context object (e.g., 'Farmer' -> 'farmers')
-                 // Simple pluralization for this logic:
-                 const typeKey = typeName.toLowerCase() + (typeName.endsWith('s') ? '' : 's');
-                 
-                 const context = state.context[s.id];
-                 // Check if the entity ID exists in the specific context array
-                 // Using 'any' cast for context[typeKey] as strict typing might require mapped types
-                 if (!context || !(context as any)[typeKey] || !(context as any)[typeKey].includes(entityId)) {
-                     pivotMatch = false;
-                 }
-             }
-        }
-        
-        // D. 搜索筛选
         const searchMatch = state.searchQuery 
           ? (s.id.toString().includes(state.searchQuery) || (s.name && s.name.includes(state.searchQuery)))
           : true;
-
-        // E. 省份筛选
         const provinceMatch = state.selectedProvince 
            ? s.production_province === state.selectedProvince 
            : true;
+
+        // Pivot 筛选 (简化版，仅作演示)
+        let pivotMatch = true;
+        if (state.pivotFilter) pivotMatch = true; 
 
         return riskMatch && scoreMatch && pivotMatch && searchMatch && provinceMatch;
       });
     },
 
-    // 2. Top 20 异常样本 (适配 ControlPanel.vue)
-    // 用于 "Top 20 Anomalies" 下拉框
+    // 2. Top 20 异常样本 (用于 ControlPanel)
     topRankedAnomalies(state): Sample[] {
-      // 依赖 filteredSamples 确保列表与当前筛选一致，或者依赖原始 samples
-      // 这里通常依赖 filteredSamples 更有交互意义，或者取全量的高风险
-      // 按照原逻辑，取 filteredSamples 中非低风险的前20
        return this.filteredSamples
         .filter(s => s.riskLevel !== '低风险') 
         .sort((a, b) => b.score - a.score) 
         .slice(0, 20); 
     },
     
-    // 2.1 Top 20 安全样本
+    // 3. [新增] Top 20 安全样本 (用于 ControlPanel)
     topRankedSafeSamples(state): Sample[] {
       return this.filteredSamples
         .filter(s => s.riskLevel === '低风险')
-        .sort((a, b) => a.score - b.score) 
+        .sort((a, b) => a.score - b.score) // 分数越低越安全
         .slice(0, 20);
     },
 
-    // 3. 当前选中样本
+    // 4. 当前选中样本
     selectedSample(state): Sample | undefined {
       if (state.selectedSampleId === null) return undefined;
       return state.samples.find(s => s.id === state.selectedSampleId);
     },
 
-    // 4. 当前上下文 (右侧面板)
+    // 5. [核心修复] 当前上下文 (增强鲁棒性)
+    // 解决了 ID 是数字但 JSON Key 是字符串导致的 "Empty" 问题
     currentContext(state): ContextData | null {
-      if (state.selectedSampleId === null) return null;
-      return state.context[state.selectedSampleId] || null;
-    },
-    
-    // Alias for compatibility if needed
-    selectedSampleContext(): ContextData | null {
-        return this.currentContext;
+      const id = state.selectedSampleId;
+      if (id === null || id === undefined) return null;
+      
+      // 优先尝试直接获取
+      // @ts-ignore
+      let ctx = state.context[id];
+      
+      // 如果没找到，尝试转字符串 (Mock 数据常见情况)
+      if (!ctx) {
+         ctx = state.context[String(id)];
+      }
+      
+      return ctx || null;
     },
 
-    // 5. 当前解释路径 (底部图表)
+    // 6. 当前解释路径
     currentExplanation(state): MetaPathChain[] | null {
       if (state.selectedSampleId === null) return null;
-      return state.explanations[state.selectedSampleId] || [];
+      // @ts-ignore
+      return state.explanations[state.selectedSampleId] || state.explanations[String(state.selectedSampleId)] || [];
     },
     
-    // Alias for compatibility
-    selectedSampleMetaPath(): MetaPathChain[] | null {
-        return this.currentExplanation;
-    },
-    
-    // 6. 当前分析模式 ('risk' or 'safe')
+    // 7. [新增] 当前分析模式 (风险 vs 安全)
+    // ContextExplorer 依赖此属性来切换红/绿颜色
     currentAnalysisMode(state): 'risk' | 'safe' {
       if (state.selectedSampleId) {
         const sample = state.samples.find(s => s.id === state.selectedSampleId);
@@ -173,10 +142,10 @@ export const useExplorerStore = defineStore('explorer', {
           return 'safe';
         }
       }
-      return 'risk';
+      return 'risk'; // 默认
     },
 
-    // 7. 当前显示的列表 (根据模式动态切换)
+    // 8. [新增] 当前显示的列表 (用于 ControlPanel 动态切换)
     currentDisplayList(): Sample[] {
        if (this.currentAnalysisMode === 'safe') {
            return this.topRankedSafeSamples;
@@ -185,30 +154,19 @@ export const useExplorerStore = defineStore('explorer', {
        }
     },
     
-    // 8. 兼容性: 全量原始数据 (供其他组件使用)
-    allSamplesRaw(state): Sample[] {
-        return state.samples;
-    },
-    allContextData(state): Record<number, ContextData> {
-        return state.context;
-    },
-    allExplanations(state): Record<number, MetaPathChain[]> {
-        return state.explanations;
-    },
-
-    // [新增] 安全实体热点图：统计实体关联了多少个【低风险】样本
+    // 9. [新增] 安全实体热点图 (用于 HotspotAnalyzer)
     entitySafetyMap(state): Map<string, number> {
       const safetyMap = new Map<string, number>();
-      if (!state.samples || !state.context) return safetyMap;
-
+      // 遍历所有样本，统计低风险样本的上下文
       for (const sample of state.samples) {
-        // 只统计低风险样本
         if (sample.riskLevel !== '低风险') continue;
         
-        const context = state.context[sample.id];
-        if (!context) continue;
+        // 使用兼容性查找
+        const ctx = state.context[sample.id] || state.context[String(sample.id)];
+        if (!ctx) continue;
 
-        for (const [typeKey, idList] of Object.entries(context)) {
+        for (const [typeKey, idList] of Object.entries(ctx)) {
+          // 简单的单复数处理
           const typeName = typeKey.charAt(0).toUpperCase() + (typeKey.endsWith('s') ? typeKey.slice(1, -1) : typeKey.slice(1));
           (idList as (string | number)[]).forEach((id: string | number) => {
             const entityName = `${typeName}[${id}]`;
@@ -218,18 +176,39 @@ export const useExplorerStore = defineStore('explorer', {
       }
       return safetyMap;
     },
+
+    // 10. 风险实体热点图 (原有逻辑)
+    entityRiskMap(state): Map<string, number> {
+      const riskMap = new Map<string, number>();
+      for (const sample of state.samples) {
+        if (sample.riskLevel === '低风险') continue;
+        
+        const ctx = state.context[sample.id] || state.context[String(sample.id)];
+        if (!ctx) continue;
+
+        for (const [typeKey, idList] of Object.entries(ctx)) {
+          const typeName = typeKey.charAt(0).toUpperCase() + (typeKey.endsWith('s') ? typeKey.slice(1, -1) : typeKey.slice(1));
+          (idList as (string | number)[]).forEach((id: string | number) => {
+            const entityName = `${typeName}[${id}]`;
+            riskMap.set(entityName, (riskMap.get(entityName) || 0) + 1);
+          });
+        }
+      }
+      return riskMap;
+    },
+
+    // 兼容旧代码的别名
+    allSamplesRaw(state): Sample[] { return state.samples; },
+    selectedSampleContext(): ContextData | null { return this.currentContext; },
+    allExplanations(state): Record<number, MetaPathChain[]> { return state.explanations; },
   },
 
   actions: {
-    // --- 初始化数据 ---
     async initialize() {
-      if (this.samples.length > 0) return; // Prevent reload if data exists
-      
+      if (this.samples.length > 0) return;
       this.loading = true;
       try {
         console.log('正在加载数据...');
-        
-        // 并行加载所有数据文件
         const [resSamples, resContext, resExplain] = await Promise.all([
           fetch('/api_data_samples.json'),
           fetch('/api_data_context.json'),
@@ -239,7 +218,6 @@ export const useExplorerStore = defineStore('explorer', {
         if (resSamples.ok) this.samples = await resSamples.json();
         if (resContext.ok) this.context = await resContext.json();
         if (resExplain.ok) this.explanations = await resExplain.json();
-        
         console.log('数据加载完成');
       } catch (error) {
         console.error('初始化数据失败:', error);
@@ -248,64 +226,30 @@ export const useExplorerStore = defineStore('explorer', {
       }
     },
 
-    // --- 交互 Action ---
     selectSample(id: number | string | null) {
       if (id === null || id === '') {
         this.selectedSampleId = null;
         return;
       }
-      // 确保 id 是数字
       const numId = typeof id === 'string' ? parseInt(id, 10) : id;
-      
-      if (this.selectedSampleId === numId) {
-        this.selectedSampleId = null; // 反选
-      } else {
-        this.selectedSampleId = numId;
-      }
+      this.selectedSampleId = (this.selectedSampleId === numId) ? null : numId;
     },
 
-    // --- 过滤器 Action (适配 ControlPanel.vue) ---
-    applyFilters() {
-      // Vue's reactivity handles the getter updates.
-      // This action can be used for logging or triggering side effects.
-      console.log('Filters applied:', this.filterOptions);
-    },
-
+    applyFilters() { console.log('Filters applied'); },
     resetFilters() {
-      this.filterOptions = {
-        riskLevels: [],
-        scoreThreshold: [0, 1]
-      };
+      this.filterOptions = { riskLevels: [], scoreThreshold: [0, 1] };
       this.searchQuery = '';
       this.pivotFilter = null;
       this.selectedProvince = null;
       this.selectedSampleId = null;
     },
-
-    clearPivotFilter() {
-      this.pivotFilter = null;
-      // Optionally reset sample selection if tied to pivot
-      // this.selectedSampleId = null; 
-    },
-    
-    // 设置 Pivot (供其他组件调用)
+    clearPivotFilter() { this.pivotFilter = null; },
     setPivotFilter(value: string | null) {
-      // Toggle if clicking the same one
-      if (this.pivotFilter === value) {
-          this.pivotFilter = null;
-      } else {
-          this.pivotFilter = value;
-      }
-      this.selectedSampleId = null; // Reset selection on filter change
+      this.pivotFilter = (this.pivotFilter === value) ? null : value;
+      this.selectedSampleId = null; 
     },
-    
-    // 设置省份筛选
     setProvinceFilter(province: string | null) {
-        if (this.selectedProvince === province) {
-            this.selectedProvince = null;
-        } else {
-            this.selectedProvince = province;
-        }
+        this.selectedProvince = (this.selectedProvince === province) ? null : province;
         this.selectedSampleId = null;
     }
   }
