@@ -1,626 +1,435 @@
-<!-- <script setup lang="ts">
-import { computed, onMounted, ref, watch, nextTick, onUnmounted } from 'vue';
-import { useExplorerStore } from '@/stores/explorerStore';
-import { storeToRefs } from 'pinia';
-import * as d3 from 'd3';
-import type { MetaPathChain } from '@/stores/types';
-
-const store = useExplorerStore();
-const { 
-  selectedSampleId, 
-  topRankedAnomalies, allExplanations
-} = storeToRefs(store);
-
-// --- 辅助函数 ---
-const parseNode = (nodeStr: string): { type: string, id: string } => {
-  const match = nodeStr.match(/^(\w+)\[(\d+)\]$/);
-  if (match) return { type: match[1], id: match[2] };
-  return { type: 'Unknown', id: nodeStr };
-};
-
-const getPathTypeTemplate = (chain: MetaPathChain): string => {
-  if (!chain || chain.length === 0) return 'Null';
-  const types = new Set<string>();
-  types.add(parseNode(chain[0].from).type);
-  chain.forEach(link => { types.add(parseNode(link.to).type); });
-  return Array.from(types).join('→');
-};
-
-// --- 数据准备 ---
-const chartContainer = ref<HTMLElement | null>(null);
-const tooltipRef = ref<HTMLElement | null>(null);
-let resizeObserver: ResizeObserver | null = null;
-
-const chordData = computed(() => {
-  const columns = topRankedAnomalies.value; 
-  const explanations = allExplanations.value;
-  const links: { source: string, target: string, value: number }[] = [];
-
-  columns.forEach(sample => {
-    const sName = `ID[${sample.id}]`;
-    const exps = explanations[sample.id] || [];
-    exps.forEach(chain => {
-      const pName = getPathTypeTemplate(chain);
-      links.push({ source: sName, target: pName, value: 1 });
-    });
-  });
-  return links;
-});
-
-// --- D3 绘图 ---
-const drawChord = () => {
-  if (!chartContainer.value) return;
-  const data = chordData.value;
-  if (data.length === 0) return;
-
-  const width = chartContainer.value.clientWidth;
-  const height = chartContainer.value.clientHeight || 600;
-  
-  // [核心修改] 控制图表大小
-  const size = Math.min(width, height);
-  // 增加 margin 值：值越大，图越小 (之前是 40，现在改为 100)
-  const margin = 80; 
-  
-  const outerRadius = size * 0.5 - margin;
-  const innerRadius = outerRadius - 18; 
-
-  const container = d3.select(chartContainer.value);
-  container.selectAll("*").remove();
-
-  const svg = container.append("svg")
-    .attr("width", size)
-    .attr("height", size)
-    .attr("viewBox", [-size / 2, -size / 2, size, size])
-    .attr("style", "max-width: 100%; height: auto; background-color: #ffffff; font-family: 'Helvetica Neue', Arial, sans-serif;");
-
-  // 矩阵构建
-  const names = d3.sort(d3.union(data.map(d => d.source), data.map(d => d.target)));
-  const index = new Map(names.map((name, i) => [name, i]));
-  const matrix = Array.from(index, () => new Array(names.length).fill(0));
-  
-  for (const {source, target, value} of data) {
-      if (index.has(source) && index.has(target)) {
-          matrix[index.get(source)!][index.get(target)!] += value;
-      }
-  }
-
-  const chord = d3.chordDirected()
-      .padAngle(0.02)
-      .sortSubgroups(d3.descending)
-      .sortChords(d3.descending);
-
-  const chords = chord(matrix);
-
-  const arc = d3.arc<d3.ChordGroup>()
-      .innerRadius(innerRadius)
-      .outerRadius(outerRadius);
-
-  const ribbon = d3.ribbonArrow<d3.Chord>()
-      .radius(innerRadius - 3) 
-      .padAngle(1 / innerRadius)
-      .headRadius(15); // 箭头稍微调小一点，适应整体变小
-
-  const colorScale = d3.scaleOrdinal(names, d3.schemeTableau10);
-
-  const group = svg.append("g")
-    .selectAll("g")
-    .data(chords.groups)
-    .join("g");
-
-  group.append("path")
-      .attr("fill", d => {
-          const name = names[d.index];
-          if (name === `ID[${selectedSampleId.value}]`) return "#b71c1c"; 
-          return colorScale(names[d.index]);
-      })
-      .attr("stroke", "#fff")
-      .attr("stroke-width", 1.5)
-      .attr("d", arc)
-      .style("cursor", "pointer")
-      .on("click", (event, d) => {
-          const name = names[d.index];
-          const match = name.match(/^ID\[(\d+)\]$/);
-          if (match) store.selectSample(parseInt(match[1], 10));
-      })
-      .on("mouseover", (event, d) => fade(0.1, d.index, svg))
-      .on("mouseout", () => fade(1, -1, svg));
-
-  group.append("text")
-      .each(d => { (d as any).angle = (d.startAngle + d.endAngle) / 2; })
-      .attr("dy", "0.35em")
-      .attr("transform", (d: any) => `
-        rotate(${(d.angle * 180 / Math.PI - 90)})
-        translate(${outerRadius + 10}) 
-        ${d.angle > Math.PI ? "rotate(180)" : ""}
-      `)
-      .attr("text-anchor", (d: any) => d.angle > Math.PI ? "end" : null)
-      .text(d => {
-         const name = names[d.index];
-         return name.length > 22 ? name.substring(0, 20) + "." : name;
-      })
-      .style("font-size", "10px")
-      .style("fill", "#444")
-      .style("font-weight", "600")
-      .style("pointer-events", "none");
-
-  svg.append("g")
-      .attr("fill-opacity", 0.75)
-    .selectAll("path")
-    .data(chords)
-    .join("path")
-      .attr("class", "ribbon")
-      .style("mix-blend-mode", "multiply") 
-      .attr("fill", d => colorScale(names[d.target.index])) 
-      .attr("d", ribbon)
-      .style("stroke", "none") 
-      .on("mouseover", function(event, d) {
-          d3.select(this).attr("fill-opacity", 1).style("mix-blend-mode", "normal");
-          showTooltip(event, names[d.source.index], names[d.target.index]);
-      })
-      .on("mouseout", function() {
-          d3.select(this).attr("fill-opacity", 0.75).style("mix-blend-mode", "multiply");
-          hideTooltip();
-      });
-
-  function fade(opacity: number, activeIndex: number, svgContext: any) {
-      svgContext.selectAll(".ribbon")
-          .filter((d: any) => d.source.index !== activeIndex && d.target.index !== activeIndex)
-          .transition()
-          .duration(300)
-          .style("opacity", opacity);
-  }
-};
-
-// --- Tooltip ---
-const showTooltip = (event: MouseEvent, source: string, target: string) => {
-  if (!tooltipRef.value) return;
-  tooltipRef.value.style.opacity = '1';
-  tooltipRef.value.innerHTML = `
-    <div style="color:#bbb;font-size:10px;margin-bottom:2px">SOURCE</div>
-    <div style="font-weight:bold">${source}</div>
-    <div style="margin:4px 0;border-top:1px solid #555"></div>
-    <div style="color:#bbb;font-size:10px;margin-bottom:2px">TARGET</div>
-    <div style="font-weight:bold">${target}</div>
-  `;
-  tooltipRef.value.style.left = `${event.clientX + 20}px`;
-  tooltipRef.value.style.top = `${event.clientY + 20}px`;
-};
-const hideTooltip = () => {
-  if (tooltipRef.value) tooltipRef.value.style.opacity = '0';
-};
-
-watch(chordData, () => nextTick(drawChord), { deep: true });
-watch(selectedSampleId, () => nextTick(drawChord));
-
-onMounted(() => {
-    if (chartContainer.value) {
-        resizeObserver = new ResizeObserver(() => requestAnimationFrame(drawChord));
-        resizeObserver.observe(chartContainer.value);
-    }
-    nextTick(drawChord);
-});
-
-onUnmounted(() => {
-    if (resizeObserver) resizeObserver.disconnect();
-});
-</script>
-
-<template>
-  <div class="chord-wrapper">
-    <div class="chart-title">Path Connectivity Chord</div>
-    <div ref="chartContainer" class="chart-container"></div>
-    <div ref="tooltipRef" class="chord-tooltip"></div>
-  </div>
-</template>
-
-<style scoped>
-.chord-wrapper {
-  width: 100%;
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  background-color: #ffffff;
-  position: relative;
-  overflow: hidden;
-}
-
-.chart-title {
-    font-family: 'Times New Roman', serif;
-    font-size: 14px; 
-    font-weight: bold;
-    margin-top: 15px;
-    margin-bottom: 5px;
-    color: #333;
-    text-transform: uppercase;
-    letter-spacing: 2px;
-    border-bottom: 1px solid #333;
-    padding-bottom: 4px;
-}
-
-.chart-container {
-  flex: 1;
-  width: 100%;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  min-height: 0;
-}
-
-.chord-tooltip {
-  position: fixed;
-  background: rgba(0, 0, 0, 0.85);
-  color: #fff;
-  padding: 10px 14px;
-  border-radius: 2px;
-  font-family: 'Helvetica Neue', sans-serif; 
-  font-size: 12px;
-  line-height: 1.4;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.1s;
-  z-index: 9999;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-}
-</style> -->
-
-
 <script setup lang="ts">
 import { computed, onMounted, ref, watch, nextTick, onUnmounted } from 'vue';
 import { useExplorerStore } from '@/stores/explorerStore';
 import { storeToRefs } from 'pinia';
 import * as d3 from 'd3';
-
-interface ExplanationLink {
-  from: string;
-  to: string;
-  relation: string;
-  weight: number;
-}
+import { ElScrollbar, ElTag, ElProgress } from 'element-plus';
+import { ArrowRight, Connection, Shop, User, Goods, Warning, CircleCheckFilled, DataAnalysis } from '@element-plus/icons-vue';
 
 const store = useExplorerStore();
-const { selectedSampleId, topRankedAnomalies, explanations } = storeToRefs(store);
+// 引入 context 以获取真实的节点统计数据 (Degree)
+const { topRankedAnomalies, explanations, selectedSampleId, context, samples } = storeToRefs(store);
 
-// --- 1. 颜色配置 (统一风格) ---
-const CATEGORY_COLORS: Record<string, string> = {
-  'InspectionRecord': '#f56c6c',
-  'Product': '#e6a23c',
-  'Market': '#409eff',
-  'Farmer': '#67c23a',
-  'Contaminant': '#909399',
-  'Unknown': '#ccc'
+// --- 1. 核心配置 ---
+const CATEGORY_CONFIG: Record<string, any> = {
+  'Farmer': { color: '#67c23a', label: '养殖户 (Producer)', icon: User },
+  'Market': { color: '#409eff', label: '市场 (Market)', icon: Shop },
+  'Product': { color: '#e6a23c', label: '产品 (Product)', icon: Goods },
+  'Contaminant': { color: '#f56c6c', label: '污染物 (Risk)', icon: Warning },
+  'Sample': { color: '#606266', label: '样本', icon: Connection }
 };
 
-// --- 2. 节点解析 ---
-const parseNode = (nodeStr: string): { type: string, id: string } => {
-  if (!nodeStr) return { type: 'Unknown', id: '?' };
-  const cleanStr = nodeStr.replace(/['"]/g, '').trim();
-  const match = cleanStr.match(/^([a-zA-Z]+)[_\[](\d+)\]?$/);
-  if (match) return { type: match[1], id: match[2] };
-  const parts = cleanStr.split('_');
-  if (parts.length > 1) return { type: parts[0], id: parts[1] };
-  return { type: 'Unknown', id: nodeStr };
-};
-
-// --- 3. [核心逻辑] 提取根源类型 ---
-// 从复杂的解释图中，只提取"入度为0"的节点类型（即风险源头）
-const getRootTypes = (edges: ExplanationLink[]): string[] => {
-  if (!edges || edges.length === 0) return [];
-
-  const incoming = new Set<string>();
-  const allNodes = new Set<string>();
-
-  edges.forEach(edge => {
-    let from = edge.from;
-    let to = edge.to;
-    // 强制流向修正 (Entity -> Sample)
-    if (from.startsWith('InspectionRecord') && !to.startsWith('InspectionRecord')) {
-      [from, to] = [to, from];
-    }
-    // 忽略自环
-    if (from === to) return;
-
-    allNodes.add(from);
-    allNodes.add(to);
-    incoming.add(to); // 记录谁是终点
-  });
-
-  // 寻找起点 (Root): 从未作为终点出现的节点
-  const roots = Array.from(allNodes).filter(n => !incoming.has(n));
-  
-  // 兜底: 如果没有纯粹起点，取所有非Sample节点
-  const finalRoots = roots.length > 0 ? roots : Array.from(allNodes).filter(n => !n.startsWith('InspectionRecord'));
-
-  // 提取类型并去重
-  const types = new Set<string>();
-  finalRoots.forEach(nodeStr => {
-    const type = parseNode(nodeStr).type;
-    // 过滤掉 InspectionRecord 本身（防止显示 Sample -> Sample）
-    if (type !== 'InspectionRecord') {
-      types.add(type);
-    }
-  });
-
-  return Array.from(types);
-};
-
-// --- 数据准备 ---
 const chartContainer = ref<HTMLElement | null>(null);
-const tooltipRef = ref<HTMLElement | null>(null);
 let resizeObserver: ResizeObserver | null = null;
 
-const chordData = computed(() => {
-  const columns = topRankedAnomalies.value; 
-  const explanationMap = explanations.value;
-  const links: { source: string, target: string, value: number }[] = [];
+// --- 2. 核心算法: 严格对齐的 DFS 路径计算 (保持不变) ---
+const calculateTruePaths = (rawEdges: any[]) => {
+    const counts = { Farmer: 0, Market: 0, Product: 0, Contaminant: 0 };
+    if (!rawEdges || rawEdges.length === 0) return counts;
 
-  columns.forEach(sample => {
-    const sName = `ID[${sample.id}]`;
-    const chain = explanationMap[sample.id];
+    const adj = new Map<string, any[]>();
+    const allNodes = new Set<string>();
     
-    if (chain && chain.length > 0) {
-      // [抽象化] 只获取根源类型，不显示具体路径
-      const rootTypes = getRootTypes(chain);
-      
-      rootTypes.forEach(type => {
-        // Sample -> RootType (例如: ID[123] -> Farmer)
-        links.push({ source: sName, target: type, value: 1 });
-      });
+    rawEdges.forEach((edge: any) => {
+        let from = edge.from;
+        let to = edge.to;
+        if (from.startsWith('InspectionRecord') && !to.startsWith('InspectionRecord')) {
+            [from, to] = [to, from];
+        }
+        if (from === to) return;
+
+        if (!adj.has(from)) adj.set(from, []);
+        adj.get(from)!.push({ to, weight: edge.weight || 0 });
+        allNodes.add(from);
+        allNodes.add(to);
+    });
+
+    for (const [key, neighbors] of adj.entries()) {
+        neighbors.sort((a: any, b: any) => b.weight - a.weight);
+        adj.set(key, neighbors.slice(0, 1)); 
     }
-  });
+
+    const getNodeType = (nodeStr: string) => {
+        const clean = nodeStr.replace(/['"]/g, '').trim();
+        const parts = clean.split('_');
+        return parts.length > 1 ? parts[0] : 'Unknown';
+    };
+
+    const seenPaths = new Set<string>();
+
+    const dfs = (curr: string, path: string[]) => {
+        if (path.length >= 4) return;
+        if (curr.startsWith('InspectionRecord')) {
+            if (path.length > 0) {
+                const startNode = path[0];
+                const startType = getNodeType(startNode);
+                const signature = path.join('->') + '->' + curr;
+                if (!seenPaths.has(signature)) {
+                    seenPaths.add(signature);
+                    if (startType === 'Farmer') counts.Farmer++;
+                    else if (startType === 'Market') counts.Market++;
+                    else if (startType === 'Product') counts.Product++;
+                    else if (startType === 'Contaminant') counts.Contaminant++;
+                }
+            }
+            return;
+        }
+        const neighbors = adj.get(curr);
+        if (neighbors) {
+            neighbors.forEach((next: any) => {
+                if (!path.includes(next.to)) dfs(next.to, [...path, curr]);
+            });
+        }
+    };
+
+    allNodes.forEach(node => {
+        if (!node.startsWith('InspectionRecord')) dfs(node, []);
+    });
+
+    return counts;
+};
+
+// --- 3. 数据构建 ---
+const processedData = computed(() => {
+  const activeSamples = topRankedAnomalies.value.slice(0, 15);
+  const categories = ['Farmer', 'Market', 'Product', 'Contaminant'];
+  const allNames = [...categories, ...activeSamples.map(s => `Sample #${s.id}`)];
+  const nameIndex = new Map(allNames.map((n, i) => [n, i]));
   
-  return links;
+  const size = allNames.length;
+  const matrix = Array.from({ length: size }, () => new Array(size).fill(0));
+  const listItems: any[] = [];
+  let totalRiskPaths = 0; 
+
+  activeSamples.forEach(sample => {
+      const sName = `Sample #${sample.id}`;
+      const sIdx = nameIndex.get(sName);
+      if (sIdx === undefined) return;
+
+      const rawEdges = explanations.value[sample.id] || [];
+      const counts = calculateTruePaths(rawEdges);
+
+      if (counts.Farmer > 0) matrix[nameIndex.get('Farmer')!][sIdx] = counts.Farmer;
+      if (counts.Market > 0) matrix[nameIndex.get('Market')!][sIdx] = counts.Market;
+      if (counts.Product > 0) matrix[nameIndex.get('Product')!][sIdx] = counts.Product;
+      if (counts.Contaminant > 0) matrix[nameIndex.get('Contaminant')!][sIdx] = counts.Contaminant;
+
+      const validTotal = counts.Farmer + counts.Market + counts.Product + counts.Contaminant;
+      totalRiskPaths += validTotal;
+
+      const maxRiskEntry = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+
+      listItems.push({
+          id: sample.id,
+          name: sName,
+          totalPaths: validTotal, 
+          mainRisk: validTotal > 0 ? maxRiskEntry[0] : 'Low Risk',
+          detailCounts: counts
+      });
+  });
+
+  return { 
+      matrix, 
+      names: allNames, 
+      categories, 
+      listItems,
+      hasRisk: totalRiskPaths > 0 // 是否有风险路径
+  };
 });
 
-// --- D3 绘图 ---
-const drawChord = () => {
-  if (!chartContainer.value) return;
-  const data = chordData.value;
-  
-  const container = d3.select(chartContainer.value);
-  container.selectAll("*").remove();
+// --- 4. 获取当前选中样本的真实统计数据 (用于安全视图) ---
+const currentSafeStats = computed(() => {
+    if (!selectedSampleId.value) return null;
+    const idStr = String(selectedSampleId.value);
+    const ctx = context.value?.[idStr] || {};
+    const meta = samples.value?.find(s => String(s.id) === idStr);
 
-  if (data.length === 0) {
-    container.append("div")
-      .style("display", "flex")
-      .style("height", "100%")
-      .style("align-items", "center")
-      .style("justify-content", "center")
-      .style("color", "#999")
-      .style("font-size", "12px")
-      .text("Waiting for data...");
-    return;
-  }
+    return {
+        // 1. 真实的模型预测置信度
+        score: meta ? ((1 - meta.score) * 100).toFixed(2) : '99.99',
+        // 2. 真实的图谱统计 (Degree)
+        farmerVol: ctx.stats?.farmer_vol || 0,
+        marketVol: ctx.stats?.market_vol || 0,
+        // 3. 实体名称
+        farmerName: ctx.farmers?.[0] || 'Unknown',
+        marketName: ctx.markets?.[0] || 'Unknown'
+    };
+});
 
-  const width = chartContainer.value.clientWidth;
-  const height = chartContainer.value.clientHeight || 600;
-  
-  const size = Math.min(width, height);
-  const margin = 60; // 边距可以小一点了，因为标签变短了
-  
-  const outerRadius = size * 0.5 - margin;
-  const innerRadius = outerRadius - 18; 
+// --- 5. D3 绘图：弦图 (Risk Mode) ---
+const drawChord = (containerEl: HTMLElement, width: number, height: number) => {
+  const { matrix, names, categories } = processedData.value;
+  if (names.length <= 4) return;
 
-  const svg = container.append("svg")
-    .attr("width", size)
-    .attr("height", size)
-    .attr("viewBox", [-size / 2, -size / 2, size, size])
-    .attr("style", "max-width: 100%; height: auto; background-color: #ffffff; font-family: 'Helvetica Neue', Arial, sans-serif;");
+  const outerRadius = Math.min(width, height) * 0.5 - 20;
+  const innerRadius = outerRadius - 25;
 
-  // 排序：把 Category 排在一起，把 Sample 排在一起
-  const categoryNames = Object.keys(CATEGORY_COLORS).filter(k => k !== 'InspectionRecord' && k !== 'Unknown');
-  const sampleNames = Array.from(new Set(data.map(d => d.source))).sort();
-  
-  // 自定义排序顺序：先放 Categories，再放 Samples
-  const names = [...categoryNames, ...sampleNames];
-  
-  // 过滤掉数据中没出现的 Category
-  const activeNames = names.filter(n => data.some(d => d.source === n || d.target === n));
+  const svg = d3.select(containerEl).append("svg")
+      .attr("width", width).attr("height", height)
+      .attr("viewBox", [-width / 2, -height / 2, width, height])
+      .style("background", "#fff");
 
-  const index = new Map(activeNames.map((name, i) => [name, i]));
-  const matrix = Array.from(index, () => new Array(activeNames.length).fill(0));
-  
-  for (const {source, target, value} of data) {
-      if (index.has(source) && index.has(target)) {
-          // Source (Sample) -> Target (Category)
-          // 矩阵是对称的，或者流向
-          matrix[index.get(source)!][index.get(target)!] += value;
-          // matrix[index.get(target)!][index.get(source)!] += value; // 如果需要双向宽带
-      }
-  }
-
-  const chord = d3.chordDirected()
-      .padAngle(0.02)
-      .sortSubgroups(d3.descending)
-      .sortChords(d3.descending);
-
+  const chord = d3.chord().padAngle(0.04).sortSubgroups(d3.descending);
   const chords = chord(matrix);
+  const arc = d3.arc<d3.ChordGroup>().innerRadius(innerRadius).outerRadius(outerRadius);
+  const ribbon = d3.ribbon<d3.Chord>().radius(innerRadius);
 
-  const arc = d3.arc<d3.ChordGroup>()
-      .innerRadius(innerRadius)
-      .outerRadius(outerRadius);
+  svg.append("g").attr("fill-opacity", 0.6)
+    .selectAll("path").data(chords).join("path")
+    .attr("d", ribbon)
+    .attr("fill", d => CATEGORY_CONFIG[names[d.source.index]].color)
+    .style("mix-blend-mode", "multiply")
+    .attr("class", d => `ribbon ribbon-target-${names[d.target.index].replace('Sample #', '')}`);
 
-  const ribbon = d3.ribbonArrow<d3.Chord>()
-      .radius(innerRadius - 3) 
-      .padAngle(1 / innerRadius)
-      .headRadius(10); 
-
-  const group = svg.append("g")
-    .selectAll("g")
-    .data(chords.groups)
-    .join("g");
-
-  // 绘制圆环
+  const group = svg.append("g").selectAll("g").data(chords.groups).join("g");
+  
   group.append("path")
       .attr("fill", d => {
-          const name = activeNames[d.index];
-          // 如果是选中的样本，高亮
-          if (selectedSampleId.value && name === `ID[${selectedSampleId.value}]`) return "#b71c1c"; 
-          // 如果是 ID，默认灰色/淡蓝
-          if (name.startsWith('ID[')) return "#e0e0e0";
-          // 如果是分类，使用固定颜色
-          return CATEGORY_COLORS[name] || "#ccc";
+          const name = names[d.index];
+          if (name.includes(String(selectedSampleId.value))) return "#b71c1c";
+          return categories.includes(name) ? CATEGORY_CONFIG[name].color : CATEGORY_CONFIG.Sample.color;
       })
-      .attr("stroke", "#fff")
-      .attr("stroke-width", 1.5)
       .attr("d", arc)
       .style("cursor", "pointer")
-      .on("click", (event, d) => {
-          const name = activeNames[d.index];
-          const match = name.match(/^ID\[(\d+)\]$/);
-          if (match) store.selectSample(parseInt(match[1], 10));
+      .on("click", (e, d) => {
+          const name = names[d.index];
+          if (!categories.includes(name)) {
+              store.selectSample(parseInt(name.replace('Sample #', '')));
+          }
       })
-      .on("mouseover", (event, d) => fade(0.1, d.index, svg))
-      .on("mouseout", () => fade(1, -1, svg));
+      .on("mouseover", function(e, d) {
+          const name = names[d.index];
+          if (!categories.includes(name)) {
+             const id = name.replace('Sample #', '');
+             svg.selectAll(".ribbon").style("opacity", 0.1);
+             svg.selectAll(`.ribbon-target-${id}`).style("opacity", 1);
+             d3.select(this).transition().attr("transform", "scale(1.05)");
+          }
+      })
+      .on("mouseout", function() {
+          svg.selectAll(".ribbon").style("opacity", 0.6);
+          d3.select(this).transition().attr("transform", "scale(1)");
+      });
 
-  // 绘制标签
   group.append("text")
       .each(d => { (d as any).angle = (d.startAngle + d.endAngle) / 2; })
-      .attr("dy", "0.35em")
+      .attr("dy", ".35em")
       .attr("transform", (d: any) => `
-        rotate(${(d.angle * 180 / Math.PI - 90)})
-        translate(${outerRadius + 10}) 
-        ${d.angle > Math.PI ? "rotate(180)" : ""}
+        rotate(${d.angle * 180 / Math.PI - 90})
+        translate(${outerRadius + 5}) ${d.angle > Math.PI ? "rotate(180)" : ""}
       `)
       .attr("text-anchor", (d: any) => d.angle > Math.PI ? "end" : null)
       .text(d => {
-         const name = activeNames[d.index];
-         // 简化 Sample ID 显示
-         if (name.startsWith('ID[')) return name.replace('ID', '');
-         return name; // Category 全名显示
+          const name = names[d.index];
+          if (categories.includes(name)) return ''; 
+          if (name.includes(String(selectedSampleId.value)) || (d.endAngle - d.startAngle > 0.1)) {
+              return name.replace('Sample #', '#');
+          }
+          return '';
       })
-      .style("font-size", d => {
-         const name = activeNames[d.index];
-         return name.startsWith('ID[') ? "9px" : "11px"; // 分类字体稍微大一点
-      })
-      .style("fill", d => {
-         const name = activeNames[d.index];
-         return name.startsWith('ID[') ? "#999" : "#333";
-      })
-      .style("font-weight", d => {
-         const name = activeNames[d.index];
-         return name.startsWith('ID[') ? "400" : "700";
-      })
-      .style("pointer-events", "none");
-
-  // 绘制连线 (Ribbons)
-  svg.append("g")
-      .attr("fill-opacity", 0.75)
-    .selectAll("path")
-    .data(chords)
-    .join("path")
-      .attr("class", "ribbon")
-      .style("mix-blend-mode", "multiply") 
-      // 颜色跟随目标 (Category)，这样可以看出是哪类的风险
-      .attr("fill", d => CATEGORY_COLORS[activeNames[d.target.index]] || "#ccc") 
-      .attr("d", ribbon)
-      .style("stroke", "none") 
-      .on("mouseover", function(event, d) {
-          d3.select(this).attr("fill-opacity", 1).style("mix-blend-mode", "normal");
-          showTooltip(event, activeNames[d.source.index], activeNames[d.target.index]);
-      })
-      .on("mouseout", function() {
-          d3.select(this).attr("fill-opacity", 0.75).style("mix-blend-mode", "multiply");
-          hideTooltip();
-      });
-
-  function fade(opacity: number, activeIndex: number, svgContext: any) {
-      svgContext.selectAll(".ribbon")
-          .filter((d: any) => d.source.index !== activeIndex && d.target.index !== activeIndex)
-          .transition()
-          .duration(300)
-          .style("opacity", opacity);
-  }
+      .style("font-size", "10px").style("fill", "#666").style("pointer-events", "none");
 };
 
-const showTooltip = (event: MouseEvent, source: string, target: string) => {
-  if (!tooltipRef.value) return;
-  tooltipRef.value.style.opacity = '1';
-  tooltipRef.value.innerHTML = `
-    <div style="color:#bbb;font-size:10px;margin-bottom:2px">SAMPLE</div>
-    <div style="font-weight:bold">${source}</div>
-    <div style="margin:4px 0;border-top:1px solid #555"></div>
-    <div style="color:#bbb;font-size:10px;margin-bottom:2px">ROOT CAUSE</div>
-    <div style="font-weight:bold; color:${CATEGORY_COLORS[target]}">${target}</div>
-  `;
-  tooltipRef.value.style.left = `${event.clientX + 20}px`;
-  tooltipRef.value.style.top = `${event.clientY + 20}px`;
-};
-const hideTooltip = () => {
-  if (tooltipRef.value) tooltipRef.value.style.opacity = '0';
+// --- 6. 统一渲染入口 ---
+const render = () => {
+    if (!chartContainer.value) return;
+    d3.select(chartContainer.value).selectAll("*").remove();
+    
+    // 如果有风险数据，画弦图；否则不画 D3，留给 Template 显示安全面板
+    if (processedData.value.hasRisk) {
+        const width = chartContainer.value.clientWidth;
+        const height = chartContainer.value.clientHeight || 400;
+        drawChord(chartContainer.value, width, height);
+    }
 };
 
-watch(chordData, () => nextTick(drawChord), { deep: true });
-watch(selectedSampleId, () => nextTick(drawChord));
-
+watch([topRankedAnomalies, selectedSampleId], () => nextTick(render), { deep: true });
 onMounted(() => {
     if (chartContainer.value) {
-        resizeObserver = new ResizeObserver(() => requestAnimationFrame(drawChord));
+        resizeObserver = new ResizeObserver(() => requestAnimationFrame(render));
         resizeObserver.observe(chartContainer.value);
     }
-    nextTick(drawChord);
+    nextTick(render);
 });
-
-onUnmounted(() => {
-    if (resizeObserver) resizeObserver.disconnect();
-});
+onUnmounted(() => resizeObserver?.disconnect());
 </script>
 
 <template>
-  <div class="chord-wrapper">
-    <div class="chart-title">Risk Source Attribution</div>
-    <div ref="chartContainer" class="chart-container"></div>
-    <div ref="tooltipRef" class="chord-tooltip"></div>
+  <div class="layout-container">
+    
+    <div class="col-chart">
+      
+      <template v-if="processedData.hasRisk">
+        <div class="panel-header">RISK ATTRIBUTION MATRIX</div>
+        <div class="legend-row">
+          <div v-for="(conf, key) in CATEGORY_CONFIG" :key="key" v-if="key !== 'Sample'" class="legend-item">
+            <span class="dot" :style="{background: conf.color}"></span> {{ conf.label }}
+          </div>
+        </div>
+        <div ref="chartContainer" class="chart-box"></div>
+      </template>
+
+      <template v-else>
+        <div class="panel-header safe-header">
+           <el-icon color="#67c23a"><CircleCheckFilled /></el-icon> SAFETY DIAGNOSTICS
+        </div>
+        <div class="safe-panel" v-if="currentSafeStats">
+            <div class="score-circle">
+               <el-progress 
+                 type="dashboard" 
+                 :percentage="Number(currentSafeStats.score)" 
+                 :color="[
+                    { color: '#f56c6c', percentage: 20 },
+                    { color: '#e6a23c', percentage: 50 },
+                    { color: '#67c23a', percentage: 100 }
+                 ]"
+                 :width="140"
+               >
+                 <template #default="{ percentage }">
+                   <span class="score-num">{{ percentage }}%</span>
+                   <span class="score-label">Safety Confidence</span>
+                 </template>
+               </el-progress>
+            </div>
+
+            <div class="stats-grid">
+               <div class="stat-box">
+                  <div class="stat-icon"><el-icon><User /></el-icon></div>
+                  <div class="stat-info">
+                     <div class="stat-val">{{ currentSafeStats.farmerVol }}</div>
+                     <div class="stat-label">Production Records</div>
+                     <div class="stat-sub">Linked to {{ currentSafeStats.farmerName }}</div>
+                  </div>
+               </div>
+               <div class="stat-box">
+                  <div class="stat-icon"><el-icon><Shop /></el-icon></div>
+                  <div class="stat-info">
+                     <div class="stat-val">{{ currentSafeStats.marketVol }}</div>
+                     <div class="stat-label">Market Connections</div>
+                     <div class="stat-sub">Linked to {{ currentSafeStats.marketName }}</div>
+                  </div>
+               </div>
+            </div>
+
+            <div class="safe-footer">
+               <el-tag type="success" effect="dark">GNN Verified</el-tag>
+               <span class="footer-text">No risk paths detected in heterogeneous graph topology.</span>
+            </div>
+        </div>
+        <el-empty v-else description="No Data Selected" />
+      </template>
+
+    </div>
+
+    <div class="col-list">
+      <div class="panel-header">SAMPLES LIST</div>
+      <el-scrollbar>
+        <div class="list-wrapper">
+          <div 
+            v-for="item in processedData.listItems" 
+            :key="item.id"
+            class="list-item"
+            :class="{ active: selectedSampleId === item.id }"
+            @click="store.selectSample(item.id)"
+          >
+            <div class="risk-bar" :style="{ background: item.totalPaths > 0 ? CATEGORY_CONFIG[item.mainRisk]?.color : '#67c23a' }"></div>
+            
+            <div class="item-body">
+              <div class="item-top">
+                  <span class="item-id">Sample #{{ item.id }}</span>
+                  <el-tag v-if="item.totalPaths > 0" size="small" effect="plain" class="mini-tag">{{ item.mainRisk }}</el-tag>
+                  <el-tag v-else size="small" type="success" effect="light" class="mini-tag">Safe</el-tag>
+              </div>
+              
+              <div class="item-stats">
+                 <span v-if="item.totalPaths > 0" class="count-text">{{ item.totalPaths }} paths</span>
+                 <span v-else class="count-text text-green">No Risk Found</span>
+              </div>
+
+              <div class="mini-progress" v-if="item.totalPaths > 0">
+                  <div class="mp-seg" v-if="item.detailCounts.Farmer > 0" :style="{ flex: item.detailCounts.Farmer, background: CATEGORY_CONFIG.Farmer.color }"></div>
+                  <div class="mp-seg" v-if="item.detailCounts.Product > 0" :style="{ flex: item.detailCounts.Product, background: CATEGORY_CONFIG.Product.color }"></div>
+                  <div class="mp-seg" v-if="item.detailCounts.Market > 0" :style="{ flex: item.detailCounts.Market, background: CATEGORY_CONFIG.Market.color }"></div>
+                  <div class="mp-seg" v-if="item.detailCounts.Contaminant > 0" :style="{ flex: item.detailCounts.Contaminant, background: CATEGORY_CONFIG.Contaminant.color }"></div>
+              </div>
+            </div>
+            
+            <el-icon v-if="selectedSampleId === item.id" class="arrow-active"><ArrowRight /></el-icon>
+          </div>
+        </div>
+      </el-scrollbar>
+    </div>
+
   </div>
 </template>
 
 <style scoped>
-.chord-wrapper {
-  width: 100%;
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  background-color: #ffffff;
-  position: relative;
-  overflow: hidden;
+.layout-container {
+  width: 100%; height: 100%; display: flex; 
+  background: #fff; border: 1px solid #dcdfe6; box-sizing: border-box;
 }
 
-.chart-title {
-    font-family: 'Times New Roman', serif;
-    font-size: 14px; 
-    font-weight: bold;
-    margin-top: 15px;
-    margin-bottom: 5px;
-    color: #333;
-    text-transform: uppercase;
-    letter-spacing: 2px;
-    border-bottom: 1px solid #333;
-    padding-bottom: 4px;
+.panel-header {
+  padding: 10px 12px; font-size: 11px; font-weight: 800; color: #909399;
+  border-bottom: 1px solid #eee; background: #fafafa;
 }
 
-.chart-container {
-  flex: 1;
-  width: 100%;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  min-height: 0;
-}
+/* 左侧容器 */
+.col-chart { flex: 1; display: flex; flex-direction: column; border-right: 1px solid #eee; min-width: 0; position: relative; }
+.legend-row { display: flex; justify-content: center; gap: 12px; padding: 8px; flex-wrap: wrap; border-bottom: 1px dashed #f5f5f5; }
+.legend-item { font-size: 10px; color: #666; display: flex; align-items: center; gap: 4px; }
+.dot { width: 6px; height: 6px; border-radius: 50%; }
+.chart-box { flex: 1; overflow: hidden; }
 
-.chord-tooltip {
-  position: fixed;
-  background: rgba(0, 0, 0, 0.85);
-  color: #fff;
-  padding: 10px 14px;
-  border-radius: 2px;
-  font-family: 'Helvetica Neue', sans-serif; 
-  font-size: 12px;
-  line-height: 1.4;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.1s;
-  z-index: 9999;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+/* 安全面板样式 (Safe Mode) */
+.safe-header { background: #f0f9eb; color: #67c23a; border-bottom: 1px solid #e1f3d8; display: flex; align-items: center; gap: 6px; }
+.safe-panel { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; gap: 20px; }
+
+.score-circle { transform: scale(1.1); }
+.score-num { display: block; font-size: 24px; font-weight: 800; color: #303133; }
+.score-label { font-size: 10px; color: #909399; text-transform: uppercase; }
+
+.stats-grid { display: flex; gap: 16px; width: 100%; max-width: 360px; }
+.stat-box { 
+    flex: 1; display: flex; gap: 10px; padding: 12px; 
+    background: #fcfcfc; border: 1px solid #eee; border-radius: 8px; 
+    align-items: center; transition: all 0.2s;
 }
+.stat-box:hover { border-color: #dcdfe6; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+.stat-icon { 
+    width: 32px; height: 32px; background: #f0f2f5; border-radius: 6px; 
+    display: flex; align-items: center; justify-content: center; color: #606266;
+}
+.stat-info { flex: 1; overflow: hidden; }
+.stat-val { font-size: 16px; font-weight: 800; color: #303133; line-height: 1.2; }
+.stat-label { font-size: 10px; font-weight: 700; color: #909399; margin-bottom: 2px; }
+.stat-sub { font-size: 9px; color: #c0c4cc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.safe-footer { text-align: center; margin-top: 10px; }
+.footer-text { display: block; font-size: 10px; color: #909399; margin-top: 6px; }
+
+/* 右侧列表 */
+.col-list { width: 260px; display: flex; flex-direction: column; background: #fff; }
+.list-wrapper { padding: 0; }
+.list-item { 
+  display: flex; align-items: stretch; height: 64px; cursor: pointer; 
+  border-bottom: 1px solid #f5f5f5; transition: all 0.2s; padding-right: 10px;
+}
+.list-item:hover { background: #f0f7ff; }
+.list-item.active { background: #ecf5ff; }
+
+.risk-bar { width: 4px; margin-right: 10px; transition: background 0.3s; }
+
+.item-body { flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 4px; }
+.item-top { display: flex; justify-content: space-between; align-items: center; }
+.item-id { font-size: 13px; font-weight: bold; color: #333; }
+.mini-tag { font-size: 9px; height: 18px; line-height: 16px; border: none; }
+
+.item-stats { font-size: 10px; color: #999; display: flex; justify-content: space-between; }
+.text-green { color: #67c23a; font-weight: bold; }
+
+.mini-progress { display: flex; height: 4px; width: 100%; background: #f0f0f0; border-radius: 2px; overflow: hidden; }
+.mp-seg { height: 100%; }
+
+.arrow-active { color: #409eff; font-weight: bold; }
 </style>

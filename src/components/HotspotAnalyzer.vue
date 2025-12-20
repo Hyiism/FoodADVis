@@ -3,32 +3,48 @@ import { onMounted, ref, watch, nextTick, onUnmounted, computed } from 'vue';
 import { useExplorerStore } from '@/stores/explorerStore';
 import { storeToRefs } from 'pinia';
 import * as d3 from 'd3';
+// 引入 Element Plus 的图标 (如果没有安装，可以用简单的 SVG 替换)
+import { FullScreen, CopyDocument } from '@element-plus/icons-vue';
 
 const store = useExplorerStore();
-const { selectedSampleId, explanations, pivotFilter } = storeToRefs(store);
+const { selectedSampleId, explanations, context, pivotFilter } = storeToRefs(store);
+
+// --- 全屏逻辑 Start ---
+const isFullscreen = ref(false);
+
+const toggleFullscreen = () => {
+  isFullscreen.value = !isFullscreen.value;
+  // 状态改变后，ResizeObserver 会捕捉到尺寸变化并触发 drawTopology
+};
+
+// 监听 ESC 键退出全屏
+const handleEscKey = (e: KeyboardEvent) => {
+  if (e.key === 'Escape' && isFullscreen.value) {
+    isFullscreen.value = false;
+  }
+};
+// --- 全屏逻辑 End ---
 
 // 1. 获取分析模式
-const currentMode = computed(() => store.currentAnalysisMode || 'risk');
+const currentMode = computed(() => {
+  if (store.currentAnalysisMode) return store.currentAnalysisMode;
+  const sample = store.samples?.find(s => s.id === selectedSampleId.value);
+  if (sample && sample.riskLevel === '低风险') return 'safe';
+  return 'risk';
+});
 
-// 2. 动态颜色配置 (Safe vs Risk)
+// 2. 动态颜色配置
 const TYPE_COLORS = computed(() => {
   const isSafe = currentMode.value === 'safe';
   return {
-    // 核心节点颜色区分
-    'InspectionRecord': isSafe ? '#67c23a' : '#e15759', // 绿 vs 红
+    'InspectionRecord': isSafe ? '#67c23a' : '#e15759', 
     'Product': '#f28e2c',          
     'Market': '#4e79a7',           
-    'Farmer': isSafe ? '#529b2e' : '#59a14f', // 安全模式下农户深绿
+    'Farmer': isSafe ? '#529b2e' : '#59a14f', 
     'Contaminant': '#76b7b2',      
     'Unknown': '#bab0ac'
   };
 });
-
-const ENTITY_TYPES = ['Farmer', 'Contaminant', 'Product', 'InspectionRecord', 'Market', 'Unknown'];
-
-const typeAngleScale = d3.scalePoint()
-  .domain(ENTITY_TYPES)
-  .range([0, 2 * Math.PI]); 
 
 const chartContainer = ref<HTMLElement | null>(null);
 const tooltipRef = ref<HTMLElement | null>(null);
@@ -36,7 +52,6 @@ const tooltipRef = ref<HTMLElement | null>(null);
 let simulation: d3.Simulation<any, any> | null = null;
 let resizeObserver: ResizeObserver | null = null;
 
-// 3. 数据准备 (增加 ID 查找容错)
 const graphData = computed(() => {
   const nodesMap = new Map<string, any>();
   const linksArr: any[] = [];
@@ -60,11 +75,61 @@ const graphData = computed(() => {
     return null;
   };
 
-  // 模式 A: Pivot (关联查询)
+  const reconstructSupplyChain = (id: number, rawCtx: any) => {
+    const chain: any[] = [];
+    const centerId = `InspectionRecord_${id}`;
+
+    const farmers = rawCtx.farmers || [];
+    const products = rawCtx.products || [];
+    const markets = rawCtx.markets || [];
+    const contaminants = rawCtx.contaminants || [];
+
+    farmers.forEach((fid: any) => {
+        const fNodeId = `Farmer_${fid}`;
+        if (products.length > 0) {
+            products.forEach((pid: any) => {
+                chain.push({ from: fNodeId, to: `Product_${pid}`, from_label: `Farmer #${fid}`, to_label: `Product #${pid}` });
+            });
+        } else {
+            chain.push({ from: fNodeId, to: centerId, from_label: `Farmer #${fid}`, to_label: `Sample #${id}` });
+        }
+    });
+
+    products.forEach((pid: any) => {
+        const pNodeId = `Product_${pid}`;
+        contaminants.forEach((cid: any) => {
+             chain.push({ from: `Contaminant_${cid}`, to: pNodeId, from_label: `Contaminant #${cid}`, to_label: `Product #${pid}` });
+        });
+        if (markets.length > 0) {
+            markets.forEach((mid: any) => {
+                chain.push({ from: pNodeId, to: `Market_${mid}`, from_label: `Product #${pid}`, to_label: `Market #${mid}` });
+            });
+        } else {
+            chain.push({ from: pNodeId, to: centerId, from_label: `Product #${pid}`, to_label: `Sample #${id}` });
+        }
+    });
+
+    markets.forEach((mid: any) => {
+        chain.push({ from: `Market_${mid}`, to: centerId, from_label: `Market #${mid}`, to_label: `Sample #${id}` });
+    });
+
+    if (chain.length === 0) {
+        Object.entries(rawCtx).forEach(([key, idList]) => {
+            let type = key.charAt(0).toUpperCase() + key.slice(1);
+            if (type.endsWith('s')) type = type.slice(0, -1);
+            if (Array.isArray(idList)) {
+                idList.forEach((nid) => {
+                    chain.push({ from: `${type}_${nid}`, to: centerId, from_label: `${type} #${nid}`, to_label: `Sample #${id}` });
+                });
+            }
+        });
+    }
+    return chain;
+  };
+
   if (pivotFilter.value) {
     const centerEntity = pivotFilter.value;
     nodesMap.set(centerEntity, { id: centerEntity, ...parse(centerEntity), isCenter: true, val: 40, displayName: centerEntity });
-
     const expMap = explanations.value || {};
     Object.entries(expMap).forEach(([sId, pathLinks]) => {
       let isRelated = false;
@@ -82,23 +147,33 @@ const graphData = computed(() => {
       }
     });
   } 
-  // 模式 B: 样本视图 (Selected Sample)
   else if (selectedSampleId.value) {
     const id = selectedSampleId.value;
     const expMap = explanations.value || {};
-    
-    // [核心修复] 查找容错：先找数字 Key，再找字符串 Key
-    const chain = expMap[id] || expMap[String(id)];
+    const ctxMap = context.value || {}; 
+
+    let chain = expMap[id] || expMap[String(id)];
+    let isReconstructed = false;
+
+    if (!chain || chain.length === 0) {
+        const rawCtx = ctxMap[id] || ctxMap[String(id)];
+        if (rawCtx) {
+            chain = reconstructSupplyChain(id, rawCtx);
+            isReconstructed = true;
+        }
+    }
 
     if (chain && chain.length > 0) {
         const centerId = `InspectionRecord_${id}`;
-        const centerLabel = getLabelFromChain(centerId, chain) || `Sample #${id}`;
+        const centerLabel = isReconstructed ? `Sample #${id} (Safe Trace)` : (getLabelFromChain(centerId, chain) || `Sample #${id}`);
         
         nodesMap.set(centerId, { id: centerId, ...parse(centerId), isCenter: true, val: 30, displayName: centerLabel });
 
         chain.forEach((link: any) => {
-            let u = link.from;
-            let v = link.to;
+            const norm = (s: string) => { const p = parse(s); return `${p.type}_${p.rawId}`; };
+            const u = norm(link.from);
+            const v = norm(link.to);
+
             if (!nodesMap.has(u)) nodesMap.set(u, { id: u, ...parse(u), val: 1, displayName: link.from_label || u });
             else nodesMap.get(u).val++;
             
@@ -118,7 +193,6 @@ const graphData = computed(() => {
   };
 });
 
-// 4. D3 绘图
 const drawTopology = () => {
   if (!chartContainer.value) return;
   if (simulation) simulation.stop();
@@ -126,12 +200,14 @@ const drawTopology = () => {
   container.selectAll("*").remove();
 
   const rawData = graphData.value;
+  const isSafe = currentMode.value === 'safe';
   
-  // 空状态
+  // 实时获取容器大小 (全屏时会自动变大)
+  const width = chartContainer.value.clientWidth;
+  const height = chartContainer.value.clientHeight || 300;
+  
   if (rawData.nodes.length === 0) {
-    const w = chartContainer.value.clientWidth;
-    const h = chartContainer.value.clientHeight || 300;
-    renderEmptyState(container, w, h);
+    renderEmptyState(container, width, height);
     return;
   }
 
@@ -139,46 +215,60 @@ const drawTopology = () => {
   let links = JSON.parse(JSON.stringify(rawData.links));
   const graphMode = rawData.mode;
 
-  const width = chartContainer.value.clientWidth;
-  const height = chartContainer.value.clientHeight || 300;
-  const maxRadius = Math.min(width, height) / 2;
+  const nodeIds = new Set(nodes.map((n: any) => n.id));
+  links = links.filter((l: any) => nodeIds.has(l.source) && nodeIds.has(l.target));
 
+  // [优化] 视口计算：全屏模式下增加一点内边距，防止贴边
   const svg = container.append("svg")
     .attr("width", width)
     .attr("height", height)
+    // 动态 ViewBox: 让图居中并适应屏幕
     .attr("viewBox", [-width / 2, -height / 2, width, height])
     .style("font-family", "'Times New Roman', serif")
-    .style("background-color", "#fff");
+    .style("background-color", isFullscreen.value ? "#f9f9f9" : "#fff");
 
   const maxVal = d3.max(nodes, (d: any) => d.val) || 1;
   const rScale = d3.scaleSqrt().domain([0, maxVal]).range([12, 30]); 
 
+  // [关键] 调整力导向力度：屏幕越大，斥力越大，连线越长
+  const chargeStrength = isFullscreen.value ? -500 : -300;
+  const linkDistance = isFullscreen.value ? 100 : 60;
+  const xForceFactor = isFullscreen.value ? 0.2 : 0.15; // 全屏时拉得更开
+
   simulation = d3.forceSimulation(nodes)
-    .force("link", d3.forceLink(links).id((d: any) => d.id).distance(80))
-    .force("charge", d3.forceManyBody().strength(-200)) 
+    .force("link", d3.forceLink(links).id((d: any) => d.id).distance(linkDistance))
+    .force("charge", d3.forceManyBody().strength(chargeStrength)) 
     .force("center", d3.forceCenter(0, 0))
-    .force("collide", d3.forceCollide().radius((d: any) => rScale(d.val) + 5).iterations(3));
+    .force("collide", d3.forceCollide().radius((d: any) => rScale(d.val) + 10).iterations(3));
 
   if (graphMode === 'SAMPLE') {
-    const angleOffset = -Math.PI / 2;
-    simulation.force("x", d3.forceX((d: any) => {
-      if (d.isCenter) return 0;
-      const angle = (typeAngleScale(d.type) || 0) + angleOffset;
-      return Math.cos(angle) * (maxRadius * 0.6); 
-    }).strength(0.3));
-
-    simulation.force("y", d3.forceY((d: any) => {
-      if (d.isCenter) return 0;
-      const angle = (typeAngleScale(d.type) || 0) + angleOffset;
-      return Math.sin(angle) * (maxRadius * 0.6);
-    }).strength(0.3));
+      const layerMap: Record<string, number> = {
+          'Farmer': -2, 'Contaminant': -1.5, 'Product': -1, 'Market': 1, 'InspectionRecord': 2
+      };
+      
+      simulation.force("x", d3.forceX((d: any) => {
+          if (d.isCenter) return width * 0.3; 
+          const layer = layerMap[d.type] || 0;
+          return layer * (width * xForceFactor); 
+      }).strength(0.5));
+      
+      simulation.force("y", d3.forceY(0).strength(0.1));
   }
 
   const contentLayer = svg.append("g").attr("class", "content-layer");
-
-  // [修改] 连线颜色：根据 Safe 模式变绿
-  const isSafe = currentMode.value === 'safe';
   const linkColor = isSafe ? '#b3e19d' : '#bbb'; 
+
+  svg.append("defs").append("marker")
+    .attr("id", "arrowhead")
+    .attr("viewBox", "0 -5 10 10")
+    .attr("refX", 25) 
+    .attr("refY", 0)
+    .attr("markerWidth", 6)
+    .attr("markerHeight", 6)
+    .attr("orient", "auto")
+    .append("path")
+    .attr("d", "M0,-5L10,0L0,5")
+    .attr("fill", linkColor);
 
   const linkSelection = contentLayer.append("g")
     .attr("class", "links")
@@ -186,8 +276,9 @@ const drawTopology = () => {
     .data(links)
     .join("line")
     .attr("stroke", linkColor) 
-    .attr("stroke-width", 1.5)
-    .attr("opacity", 0.6);
+    .attr("stroke-width", 2)
+    .attr("opacity", 0.7)
+    .attr("marker-end", "url(#arrowhead)");
 
   const nodeSelection = contentLayer.append("g")
     .selectAll(".node")
@@ -202,29 +293,23 @@ const drawTopology = () => {
             if (!d.isCenter) store.setPivotFilter(d.id);
         } else {
             if (d.type === 'InspectionRecord') {
-                const rawIdStr = d.id.split('_')[1];
-                store.selectSample(parseInt(rawIdStr));
+                const cleanId = d.id.replace(/[^0-9]/g, '');
+                store.selectSample(parseInt(cleanId));
                 store.clearPivotFilter();
-            } else if (d.isCenter) {
-                store.clearPivotFilter();
-            }
+            } else if (d.isCenter) store.clearPivotFilter();
         }
     });
 
-  // [修改] 节点填充色：实时从 TYPE_COLORS 计算属性获取
   nodeSelection.append("circle")
     .attr("r", (d: any) => d.isCenter ? 28 : rScale(d.val))
-    .attr("fill", (d: any) => {
-        if (d.isCenter) return isSafe ? '#444' : '#333'; 
-        return TYPE_COLORS.value[d.type] || '#ccc';
-    })
+    .attr("fill", (d: any) => d.isCenter ? (isSafe ? '#444' : '#333') : (TYPE_COLORS.value[d.type] || '#ccc'))
     .attr("stroke", "#fff")
     .attr("stroke-width", 2);
 
   nodeSelection.append("circle")
     .attr("r", (d: any) => (d.isCenter ? 28 : rScale(d.val)) + 4)
     .attr("fill", "none")
-    .attr("stroke", isSafe ? '#67c23a' : '#333') // 外圈颜色也变化
+    .attr("stroke", isSafe ? '#67c23a' : '#333')
     .attr("stroke-width", 1)
     .attr("stroke-dasharray", "3,2")
     .attr("opacity", (d: any) => (pivotFilter.value && pivotFilter.value === d.id) ? 1 : 0);
@@ -238,27 +323,25 @@ const drawTopology = () => {
     .style("fill", "#fff")
     .style("pointer-events", "none");
 
-  // 背景标签
+  // [优化] 全屏模式下，标签字体可以稍微大一点
   if (graphMode === 'SAMPLE') {
-    const labelLayer = svg.append("g").attr("class", "labels").lower();
-    const angleOffset = -Math.PI / 2;
-    ENTITY_TYPES.forEach(type => {
-       if(['Farmer', 'Market', 'Product', 'Contaminant'].includes(type)) {
-           const angle = (typeAngleScale(type) || 0) + angleOffset;
-           const lx = Math.cos(angle) * (maxRadius * 0.9);
-           const ly = Math.sin(angle) * (maxRadius * 0.9);
-           labelLayer.append("text")
-             .text(type)
-             .attr("x", lx)
-             .attr("y", ly)
-             .attr("text-anchor", "middle")
-             .attr("dy", "0.35em")
-             .style("font-size", "9px")
-             .style("fill", "#ddd")
-             .style("font-weight", "bold")
-             .style("pointer-events", "none");
-       }
-    });
+      const titles = [
+          { text: "Production", x: -width * (isFullscreen.value ? 0.3 : 0.25) },
+          { text: "Logistics", x: 0 },
+          { text: "Inspection", x: width * (isFullscreen.value ? 0.3 : 0.25) }
+      ];
+      const titleLayer = svg.append("g").attr("class", "titles").lower();
+      titles.forEach(t => {
+          titleLayer.append("text")
+            .attr("x", t.x)
+            .attr("y", -height/2 + (isFullscreen.value ? 40 : 20))
+            .text(t.text)
+            .attr("text-anchor", "middle")
+            .style("fill", "#ddd")
+            .style("font-size", isFullscreen.value ? "14px" : "11px") // 全屏字体变大
+            .style("font-weight", "bold")
+            .style("letter-spacing", "1px");
+      });
   }
 
   simulation.on("tick", () => {
@@ -309,16 +392,16 @@ const hideTooltip = () => { if (tooltipRef.value) tooltipRef.value.style.opacity
 const renderEmptyState = (container: any, width: number, height: number) => {
   const svg = container.append("svg").attr("width", width).attr("height", height);
   svg.append("text").attr("x", width/2).attr("y", height/2)
-     .text(selectedSampleId.value ? "No Explanation Path" : "Select a Sample")
+     .text(selectedSampleId.value ? "No Data Available" : "Select a Sample")
      .attr("text-anchor", "middle").style("fill", "#ccc").style("font-size", "12px");
 };
 
-// [核心修复] 监听 currentMode，一旦变化强制重绘
-watch([selectedSampleId, pivotFilter, explanations, currentMode], () => {
+watch([selectedSampleId, pivotFilter, explanations, context, currentMode], () => {
     nextTick(drawTopology);
 });
 
 onMounted(() => {
+  window.addEventListener('keydown', handleEscKey); // 添加 ESC 监听
   if (chartContainer.value) {
     resizeObserver = new ResizeObserver(() => requestAnimationFrame(drawTopology));
     resizeObserver.observe(chartContainer.value);
@@ -327,31 +410,62 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  window.removeEventListener('keydown', handleEscKey); // 移除监听
   if (resizeObserver) resizeObserver.disconnect();
   if (simulation) simulation.stop();
 });
 </script>
 
 <template>
-  <div class="graph-wrapper">
-    <div class="chart-title">
-        <span v-if="pivotFilter">Pivot View</span>
-        <span v-else>
-            {{ currentMode === 'safe' ? '✨ Safe Traceability' : '🚨 Causal Topology' }}
-        </span>
+  <div class="graph-wrapper" :class="{ 'is-fullscreen': isFullscreen }">
+    <div class="chart-header">
+        <div class="chart-title">
+            <span v-if="pivotFilter">Pivot View</span>
+            <span v-else>
+                {{ currentMode === 'safe' ? '✨ Safe Traceability' : '🚨 Causal Topology' }}
+            </span>
+        </div>
+        <div class="header-actions">
+            <el-icon class="action-icon" @click="toggleFullscreen" title="Toggle Fullscreen">
+                <component :is="isFullscreen ? CopyDocument : FullScreen" />
+            </el-icon>
+        </div>
     </div>
+    
     <div ref="chartContainer" class="chart-container"></div>
     <div ref="tooltipRef" class="graph-tooltip"></div>
   </div>
 </template>
 
 <style scoped>
-/* 样式保持不变 */
 .graph-wrapper {
   width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center;
   background-color: #ffffff; padding: 10px; box-sizing: border-box; 
   position: relative;
   border-left: 1px solid #f0f0f0; 
+  transition: all 0.3s ease; /* 添加过渡效果 */
+}
+
+/* 全屏模式样式 */
+.graph-wrapper.is-fullscreen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 2000; /* 确保层级极高 */
+  padding: 20px;
+  border: none;
+}
+
+.chart-header {
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid #eee;
+    padding-bottom: 4px;
+    margin-bottom: 5px;
 }
 
 .chart-title {
@@ -361,11 +475,24 @@ onUnmounted(() => {
     color: #333;
     text-transform: uppercase;
     letter-spacing: 1px;
-    border-bottom: 1px solid #eee;
-    padding-bottom: 4px;
-    margin-bottom: 5px;
-    width: 100%;
-    text-align: center;
+}
+
+.header-actions {
+    display: flex;
+    align-items: center;
+}
+
+.action-icon {
+    cursor: pointer;
+    font-size: 16px;
+    color: #666;
+    transition: color 0.2s;
+    padding: 4px;
+    border-radius: 4px;
+}
+.action-icon:hover {
+    color: #409eff;
+    background-color: #f0f7ff;
 }
 
 .chart-container {
@@ -385,7 +512,7 @@ onUnmounted(() => {
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.1s;
-  z-index: 9999;
+  z-index: 9999; /* 比全屏容器更高 */
   box-shadow: 0 2px 8px rgba(0,0,0,0.1);
 }
 </style>
