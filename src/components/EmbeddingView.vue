@@ -53,7 +53,6 @@ const chartOption = computed(() => ({
         <b>样本 ID: ${data[3]}</b><br/>
         风险等级: ${data[4]}<br/>
         异常分数: ${data[2].toFixed(4)}<br/>
-        (x: ${data[0].toFixed(2)}, y: ${data[1].toFixed(2)})
       `;
     }
   },
